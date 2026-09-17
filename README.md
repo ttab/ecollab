@@ -17,9 +17,10 @@ cross-compiles it like anything else.
 ## Status
 
 Spike-quality, extracted from the service it names, and still
-growing: the tree contract and the presence schema are here, and the
-named-document grammar, the protocol vocabulary and the `Collaborate`
-client follow. A `v0.x` tag is honest about the surface still moving.
+growing: the tree contract, the presence schema and the
+named-document grammar are here, and the protocol vocabulary and the
+`Collaborate` client follow. A `v0.x` tag is honest about the surface
+still moving.
 
 ## The tree contract
 
@@ -193,7 +194,47 @@ inner map whole, pruning against the subscription table. Presence
 mutations replay the whole stream, so the service batches them; a
 reader never needs to know that.
 
-## Allowed Yjs types in named documents
+## Named documents
+
+A named document is a Yjs document the collab service hosts itself,
+not a mirror of a repository document, and it is addressed by a
+reserved `__`-prefixed id rather than a UUID. `ecollab/named` is the
+grammar:
+
+```go
+doc, err := named.Classify(docID)        // kind, and the parsed parts
+id := named.FormatUserDocID(sub, "bookmarks")
+state, err := named.WalkToJSON(yDoc, doc.RootName())
+```
+
+Two kinds exist:
+
+- **`__presence__`** — the service-managed presence document above.
+  `named.KindService`, any authenticated caller may subscribe,
+  read-only, and its state lives under `presence.RootName`.
+- **`__user:{url-encoded sub}:{name}`** — one person's own
+  observable state: bookmarks, recents, UI preferences.
+  `named.KindUser`, read-write to the owner and to nobody else, under
+  the conventional `ecollab.RootName`.
+
+Anything else `__`-prefixed is `ErrUnknownNamedDoc`, and a
+recognized kind that will not parse is `ErrMalformedNamedDoc`: the
+`__` prefix is reserved, so a client cannot conjure a named document
+by picking a new name for one. An id without the prefix classifies
+as `named.KindRepository` and is not parsed further, which is what
+lets a caller run `Classify` on every id it handles and branch on
+the kind.
+
+`FormatUserDocID` is the only writer of the user-scoped form. The
+owner's subject is URL-encoded, so a hand-built id that encodes it
+differently is a different document — the round trip through
+`Classify` is the definition.
+
+`Doc.RootName()` answers which YMap root the document's state lives
+under, and going through it is what keeps a writer, a reader and the
+service's inspection on the same root.
+
+### Allowed Yjs types in named documents
 
 Named documents are *conventionally* restricted to **YMap, YArray,
 and string** — the same type set as the NewsDoc-translatable portion
@@ -208,15 +249,16 @@ This is a *convention*, not an enforced contract. The transport,
 persistence, and convergence layers are all type-agnostic: the
 service appends opaque update bytes, the snapshotter re-encodes via
 `EncodeStateV2`, and clients apply opaque updates — none inspect Yjs
-types. The only place a named doc's content is walked by type is the
-service's `InspectNamedDocument`. Rather than enforce the convention
-on the hot write path (which would add a rebuild to every write
-purely to guard a support endpoint), the walk renders any rich type
-that does land in a named doc **best-effort**: YText/YXmlText become
-their plain string, YXmlElement its serialized XML, binary base64,
-and the non-stringable shared types (fragment, subdoc, weak) plus any
-unknown kind a `{"_yjs": "..."}` marker. Inspection therefore never
-fails on unexpected content.
+types. The only place a named doc's content is walked by type is
+`WalkToJSON`, which the service's `InspectNamedDocument` serves from.
+Rather than enforce the convention on the hot write path (which would
+add a rebuild to every write purely to guard a support endpoint), the
+walk renders any rich type that does land in a named doc
+**best-effort**: YText/YXmlText become their plain string,
+YXmlElement its serialized XML, binary base64, and the
+non-stringable shared types (fragment, subdoc, weak) plus any unknown
+kind a `{"_yjs": "..."}` marker. Inspection therefore never fails on
+unexpected content.
 
 ## Development
 

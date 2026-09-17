@@ -1,0 +1,80 @@
+version: "2"
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - dogsled
+    - dupl
+    - errorlint
+    - exhaustive
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - godot
+    - godox
+    - gomoddirectives
+    - goprintffuncname
+    - gosec
+    - lll
+    - makezero
+    - misspell
+    - nakedret
+    - nestif
+    - nilnil
+    - nlreturn
+    - nolintlint
+    - predeclared
+    - revive
+    - staticcheck
+    - testpackage
+    - thelper
+    - unconvert
+    - unparam
+    - whitespace
+    - wrapcheck
+    - wsl_v5
+  settings:
+    goconst:
+      # A literal repeated across table-driven cases and fixtures is
+      # usually clearer inline than behind a name.
+      ignore-tests: true
+      ignore-string-values:
+        # NewsDoc field names. Each appears once per translation
+        # table, and there are four: document and block, read and
+        # write. Hoisting one of them to a constant would make it
+        # inconsistent with the sibling literals it sits among, and
+        # hoisting all of them would replace a table you can read
+        # against newsdoc.proto with a table you cannot.
+        - uuid
+        - type
+        - uri
+        - url
+        - title
+        - content
+        - meta
+        - links
+    godox:
+      keywords:
+        - FIXME
+        - BUG
+    gomoddirectives:
+      # goyjs and elephant-api are pointed at working copies while
+      # their contracts are still in flight; the replaces go before
+      # the first tag.
+      replace-local: true
+    nestif:
+      min-complexity: 6
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+formatters:
+  enable:
+    - gci
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax

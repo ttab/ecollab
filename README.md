@@ -17,9 +17,9 @@ cross-compiles it like anything else.
 ## Status
 
 Spike-quality, extracted from the service it names, and still
-growing: the tree contract is here, and presence, the named-document
-grammar, the protocol vocabulary and the `Collaborate` client follow.
-A `v0.x` tag is honest about the surface still moving.
+growing: the tree contract and the presence schema are here, and the
+named-document grammar, the protocol vocabulary and the `Collaborate`
+client follow. A `v0.x` tag is honest about the surface still moving.
 
 ## The tree contract
 
@@ -138,6 +138,60 @@ Two consequences worth being explicit about:
   article-editor plugin store in `_collab` during this session" can
   be answered by replaying the archive — though no normal use case
   needs this.
+
+## The presence document
+
+`__presence__` is a single service-managed named document carrying
+who is subscribed to what, tenant-wide. The collab service is its
+only writer; any authenticated caller may subscribe to it read-only.
+`ecollab/presence` owns its schema:
+
+```go
+entries := presence.Read(yDoc)          // by doc id, then subscription id
+who := presence.ReadDoc(yDoc, docID)    // one document's participants
+```
+
+- The document id is `presence.DocID` (`__presence__`).
+- The state lives under the YMap root `presence.RootName`
+  (`by_doc`) — deliberately not the `RootName` a repository document
+  uses.
+- The root is keyed by **doc id**. Each value is a nested YMap keyed
+  by **subscription id**, and each of those is a flat YMap carrying
+  one `presence.Entry`: `subject`, `joined_at` (RFC3339Nano, UTC),
+  `doc_kind`, and `identity` (the JSON form of `presence.Identity`).
+
+Keying the outer map by doc id is what makes the document usable as
+a live index: a client rendering a document list binds reactively to
+the value at one doc id and picks up that document's presence
+changes without walking every participant in the tenant.
+
+Reading is best-effort, as materialisation is: a field of the wrong
+Yjs kind, an unparseable `joined_at` or an `identity` that is not the
+JSON this package writes yields the zero value for that field. One
+malformed entry does not cost a reader the document.
+
+`Entry.Input()` is the other direction, and the service writes
+through it — both on a join and when the presence reconciler rebuilds
+an entry a lost write dropped, so a repaired entry reads exactly as
+the join would have written it.
+
+### The schema is a contract
+
+Presence used to be an implementation detail of the service's
+subscribe orchestrator. It is not one any more: with a reader here,
+**changing an entry field is a change to this package first**, then
+to the service, and only a version of each that agree will round-trip
+an entry. Adding a field means adding it to `Entry` and to both its
+encoder and its reader in one commit; renaming or removing one is a
+breaking change to every consumer reading the document.
+
+Two things are deliberately *not* here, because they are the
+service's and not the schema's: which doc kinds write presence at all
+(the service's `sub.DocKindWritesPresence` is the single answer), and
+every mutation — replaying the presence stream, rewriting a per-doc
+inner map whole, pruning against the subscription table. Presence
+mutations replay the whole stream, so the service batches them; a
+reader never needs to know that.
 
 ## Allowed Yjs types in named documents
 

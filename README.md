@@ -22,8 +22,10 @@ formats described here cannot change independently of the service that
 speaks them, so they move at its pace rather than this library's.
 
 What is here: the tree contract between a Y.Doc and a NewsDoc, the
-presence schema, the named-document grammar, the protocol vocabulary,
-the WebSocket and archive wire codecs, and the `Collaborate` client.
+reach into the application-private state a person's editor works in,
+the presence schema, the named-document grammar, the protocol
+vocabulary, the WebSocket and archive wire codecs, and the
+`Collaborate` client.
 The client is exercised against a running server by the service's own
 integration tests.
 
@@ -65,6 +67,11 @@ appear** in the NewsDoc-translatable portion of the tree. Plain
 strings carry NewsDoc text content. This keeps the materialization
 mechanical, and keeps the Yjs binding's scope minimal — nothing in
 this path ever needs to operate on rich Yjs types.
+
+The rich values a person is actually typing into live under
+`_collab`, beside this tree rather than in it. Reading and editing
+them is a separate job with separate tools; see
+["Editing what a person is editing"](#editing-what-a-person-is-editing).
 
 ### Translation rules
 
@@ -144,6 +151,124 @@ Two consequences worth being explicit about:
   article-editor plugin store in `_collab` during this session" can
   be answered by replaying the archive — though no normal use case
   needs this.
+
+## Editing what a person is editing
+
+The NewsDoc-shaped tree is a snapshot of committed values. The values
+a person has open in an editor are the rich ones under `_collab`, and
+a program that means to edit alongside that person edits those. This
+is what `Collab` reaches.
+
+```go
+collab := ecollab.CollabOn(yDoc.Map(ecollab.RootName))
+```
+
+`CollabOn` takes the map that owns the state — a document root YMap,
+or a block YMap read out of one — and reads nothing; the maps it
+names may all be absent. Under it the layout is three levels deep:
+
+```text
+document                 the root YMap, named RootName
+  _collab                CollabKey, a YMap keyed by application ID
+    se.ecms.editor       one YMap per application
+      _hydrated          HydratedKey, the application's markers
+      title              one rich value per editable field
+      body
+```
+
+The accessors follow it: `Map` for the `_collab` map, `App` for one
+application's map, `Field` for the value it holds for a field key,
+`FieldNode` for the same value as a `goyjs.Node` — a handle that
+addresses the value by identity and is what the goyjs write methods
+take — and `Hydrated` for the application's own marker. Every read
+takes a `goyjs.ReadTxn` and every write a `goyjs.WriteTxn`, so the
+reach composes with whatever else is happening in the same
+transaction. Nothing here interprets the values; what is under the
+application's key is still the application's own concern.
+
+A field is a `Y.XmlText` whose delta is a sequence of embedded
+`Y.XmlText` blocks, each carrying its properties as node attributes
+and its text runs, with their marks as format attributes, in its own
+delta. goyjs reads that whole and writes it back; its README
+documents the delta, the node handles and the write scope.
+
+### Offsets are UTF-16 code units
+
+Every index and length that reaches a rich value — a retain, a
+delete, an insertion point, a format range — counts UTF-16 code
+units, because that is what Yjs counts and what the editor on the
+other end derived its own numbers in. An embedded block is one unit
+and a character outside the Basic Multilingual Plane is two.
+`goyjs.UTF16Len` measures a Go string in them. An index computed from
+`len(s)` over a Go string is wrong from the first non-ASCII
+character, which in Swedish copy is the first word.
+
+### Editing is cheap, creating is not
+
+Two participants editing one rich value is what Yjs is for, and it
+costs nothing: read the field, take its node, write through it.
+
+```go
+err := yDoc.Write(func(w *goyjs.WriteTxn) error {
+    body, ok := collab.FieldNode(w.ReadTxn(), appID, "body")
+    if !ok {
+        return errors.New("no body to edit")
+    }
+
+    body.ApplyDelta(w, delta)
+
+    return nil
+})
+if errors.Is(err, goyjs.ErrStaleNode) {
+    // The value is gone: read the field again and work on what is there.
+}
+```
+
+Creating a field is the dangerous half, and the hazard is structural
+rather than a bug anyone can fix. Yjs resolves two participants
+setting the same map key to one winner; the loser's map is deleted
+with everything under it, including text already typed into a rich
+value it held. That applies to each of the three levels — two
+concurrent creates of `_collab` itself lose one application's whole
+state.
+
+`EnsureField` makes the local half safe and says so about the rest:
+
+```go
+err := yDoc.Write(func(w *goyjs.WriteTxn) error {
+    _, err := collab.EnsureField(w, appID, "body",
+        goyjs.XMLTextValue(nil, seed))
+    if err != nil {
+        return fmt.Errorf("ensure body: %w", err)
+    }
+
+    return nil
+})
+```
+
+The check and the create are one write scope, so no other goroutine
+on this document can slip between them, and the subtree is written
+whole, so a peer never observes the map without the field. What it
+cannot prevent is a concurrent create by a **peer**. So:
+
+- **Edit a field that exists** rather than creating one.
+- **Create only what the authoring application has not.** `Hydrated`
+  reports whether the application considers the field its own; a
+  marked field is one to edit, never one to replace.
+- **Where a create is unavoidable, do it once and early**, before
+  anyone has typed into the field, so a lost create costs an empty
+  value rather than a paragraph.
+
+After a create that lost, the goyjs handles say so rather than
+failing silently: a write through the node returns an error matching
+`goyjs.ErrStaleNode`, and reading the field reports it absent. The
+response to both is to read again and work on what is there.
+
+A value on the path that is not a map — a `_collab` key holding a
+string — is refused with `ErrCollabShape` and nothing is recorded in
+the scope. It means some participant is writing a different structure
+under the same keys, and overwriting it would destroy whatever that
+is.
 
 ## The presence document
 

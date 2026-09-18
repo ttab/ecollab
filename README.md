@@ -23,9 +23,9 @@ speaks them, so they move at its pace rather than this library's.
 
 What is here: the tree contract between a Y.Doc and a NewsDoc, the
 reach into the application-private state a person's editor works in,
-the presence schema, the named-document grammar, the protocol
-vocabulary, the WebSocket and archive wire codecs, and the
-`Collaborate` client.
+the decoding of the carets an editor publishes into awareness, the
+presence schema, the named-document grammar, the protocol vocabulary,
+the WebSocket and archive wire codecs, and the `Collaborate` client.
 The client is exercised against a running server by the service's own
 integration tests.
 
@@ -269,6 +269,110 @@ string — is refused with `ErrCollabShape` and nothing is recorded in
 the scope. It means some participant is writing a different structure
 under the same keys, and overwriting it would destroy whatever that
 is.
+
+### Reading where the other participants are
+
+An editor built on `@slate-yjs/core` binds `withCursors` to the
+`Y.XmlText` it is editing and publishes the caret into awareness as a
+pair of relative positions against that value. `CursorReader` decodes
+that, so a program can ask of a peer's awareness state which value
+they are editing and where in it:
+
+```go
+cursors, err := ecollab.NewCursorReader().Cursors(awareness)
+if err != nil {
+    return fmt.Errorf("read the peers' carets: %w", err)
+}
+
+for _, c := range cursors {
+    resolved, err := c.Resolve(yDoc, read)
+    if errors.Is(err, goyjs.ErrStaleNode) {
+        continue // the value that peer was editing is gone
+    }
+    if err != nil {
+        return fmt.Errorf("resolve a caret: %w", err)
+    }
+
+    if collab.Editing(read, appID, "body", resolved.Range.Anchor) {
+        // This peer has the caret in the body of this block.
+    }
+}
+```
+
+`Cursors` reads every participant but the local client, ordered by
+client ID, and leaves out the ones with no selection — a `null`
+cursor field is a participant who is present and not in a text. A
+state whose envelope is there but cannot be read is an error rather
+than a silent absence: it means the editor and the reader disagree
+about the envelope, which is worth seeing.
+
+The envelope is the application's choice, so it is the reader's to be
+told. `WithCursorField` and `WithCursorDataField` name the two state
+fields; they default to `DefaultCursorField` (`cursor`) and
+`DefaultCursorDataField` (`data`), the names `@slate-yjs/core` uses.
+`Cursor.Data` is whatever the editor publishes beside the caret — a
+display name, a colour — left as JSON because its shape is the
+editor's too. The pair inside the envelope is `anchor` and `focus`,
+which is `goyjs.Range`'s spelling; an editor that wraps its positions
+some other way is decoded by unmarshalling the state into your own
+type and letting `goyjs.Position` decode each end. The library stops
+at the position, and this package is only the common envelope around
+it.
+
+`Editing` is the question asked per block: does this end of the caret
+point into the value that application holds for that field here. It
+is false for a value of another application, for a field the owner
+does not have, and for a position that landed anywhere else. A
+selection spanning two blocks has its ends in different values, so a
+program that must not touch either asks about both.
+
+### Holding a place while you think
+
+An offset is true only for the document it was computed from. A
+program that reads a block, spends a second deciding, and then writes
+at the offset it found writes in the wrong place if anyone typed
+before that point meanwhile — silently, and the more often the longer
+it thinks. A `goyjs.Range` names a run by the identity of the text
+in it, so it is still the same run afterwards:
+
+```go
+// While reading: turn the offset into a range immediately, against
+// the document the offset was computed from.
+held, err := body.Range(read, offset, goyjs.UTF16Len(phrase))
+
+// Later, in the write scope, against whatever the document has become.
+resolved, err := yDoc.ResolveRange(w.ReadTxn(), held)
+start, length, ok := resolved.Span()
+```
+
+What holding a range does not promise:
+
+- **It is a place, not a lock and not a claim on the words.** What
+  lies between the ends may have been rewritten while both ends still
+  resolve, so an annotation lands on the place the program chose, not
+  necessarily on the text it read. A `length` of 0 means the run was
+  deleted and there is nothing left to annotate.
+- **The value can be gone.** A block deleted, a field replaced by a
+  create that won: resolution reports `goyjs.ErrStaleNode`, which is
+  an ordinary outcome of concurrent editing. Read the parent again and
+  decide again.
+- **`ok == false` from `Span` means the ends are in different
+  values.** A range taken with `Node.Range` always has both ends in
+  one value; a caret read out of awareness need not, because a person
+  can select across blocks.
+- **A peer can be ahead.** `goyjs.ErrPositionUnseen` says the position
+  names content this document has not received yet; sync and resolve
+  again rather than discarding it.
+- **Awareness is a snapshot, a range is not.** Knowing which blocks
+  the peers were in when you looked says nothing about where they will
+  type next — which is exactly why the range, and not the reading of
+  awareness, is what makes a deferred write land correctly.
+
+`example_agent_test.go` is all of this in one file: an agent reads the
+peers' carets, leaves the block a human is in alone, holds a range
+over the run it decided to comment on, and attaches the comment after
+a colleague has typed at the start of that block. It is meant to be
+read and copied.
 
 ## The presence document
 

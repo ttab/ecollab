@@ -17,10 +17,10 @@ cross-compiles it like anything else.
 ## Status
 
 Spike-quality, extracted from the service it names, and still
-growing: the tree contract, the presence schema and the
-named-document grammar are here, and the protocol vocabulary and the
-`Collaborate` client follow. A `v0.x` tag is honest about the surface
-still moving.
+growing: the tree contract, the presence schema, the named-document
+grammar and the protocol vocabulary are here, and the `Collaborate`
+client follows. A `v0.x` tag is honest about the surface still
+moving.
 
 ## The tree contract
 
@@ -259,6 +259,71 @@ YXmlElement its serialized XML, binary base64, and the
 non-stringable shared types (fragment, subdoc, weak) plus any unknown
 kind a `{"_yjs": "..."}` marker. Inspection therefore never fails on
 unexpected content.
+
+## The protocol vocabulary
+
+The strings a participant and the service exchange about a session,
+as opposed to the document's contents. They are here because a
+client has to act on them, and acting on them means agreeing with
+the service about what each one is.
+
+### Encoding tags
+
+`ecollab.Encoding` tags what one entry in a document's update log
+carries. The tag travels with the entry wherever the entry goes — a
+live subscription, the S3 archive, and `SessionUpdateRecord.encoding`
+on the archive-reading RPCs — so a program replaying a session sees
+the same vocabulary the live pipeline used:
+
+| Tag | Carries |
+| --- | --- |
+| `v1`, `v2` | Yjs document updates. Apply in stream order. |
+| `v1-seed`, `v2-seed` | Yjs updates the emitter called structural seeding rather than authorship. Apply them exactly as `v1` and `v2` — the tag is for attribution, not for filtering. |
+| `aw` | An awareness update. Not document state; never apply it to a Y.Doc. |
+| `evict` | The session ended. A live subscriber sees it as a `Close` with reason `session_terminated`. |
+| `stateless` | A server-issued lifecycle event, `{"event": ..., "data": ...}`. |
+| `step2` | The catch-up diff for one subscriber. Addressed to a subscriber rather than to the document, so it is never persisted and never appears in the archive. |
+
+The set is closed and the values are durable: a record written years
+ago still carries one of these strings, so a value can be added but
+never repurposed.
+
+### Subscription mode
+
+`ecollab.SubscriptionMode` is the read/write capability the service
+granted a subscription, decided once when it opens and carried on
+the `Synced` message that ends initial state transfer. Believe it:
+an update sent on a `read_only` subscription is refused and closes
+that subscription rather than being ignored.
+
+### Close reasons
+
+A subscription the server closes on its own carries one of
+`ecollab.CloseReason*` as the reason on the `Close` message, and a
+connection it refuses carries one on the terminal error — in the
+`reason` metadata on the Connect stream, or in the close frame on
+the WebSocket transport. The reason, not the code, is what says what
+to do about it: `no_active_session` means read the repository
+version instead, `session_terminated` means subscribe again for a
+fresh session, `token_expired` means re-authorize, `rate_limited`
+means coalesce rather than reconnect.
+
+The constants are untyped, so they compare directly against the
+wire's plain string.
+
+### State vectors
+
+`ecollab.StateVector` decodes the lib0 state vector goyjs produces
+and the service echoes back in the `server_state_vector` metadata
+when it refuses a snapshot as stale. `Dominates` answers the
+question that refusal was about — has this participant seen
+everything the server had — and `FirstShortfall` names a client it
+is behind on. `DecodeStateVector` refuses a vector with more than
+`MaxStateVectorEntries` entries rather than honouring a
+caller-controlled allocation hint.
+
+`ecollab/lib0` is the varint and varstring layer underneath, shared
+with the WebSocket envelope and the archive's chunk records.
 
 ## Development
 

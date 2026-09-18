@@ -18,9 +18,9 @@ cross-compiles it like anything else.
 
 Spike-quality, extracted from the service it names, and still
 growing: the tree contract, the presence schema, the named-document
-grammar and the protocol vocabulary are here, and the `Collaborate`
-client follows. A `v0.x` tag is honest about the surface still
-moving.
+grammar, the protocol vocabulary and the two wire codecs are here,
+and the `Collaborate` client follows. A `v0.x` tag is honest about
+the surface still moving.
 
 ## The tree contract
 
@@ -323,7 +323,61 @@ is behind on. `DecodeStateVector` refuses a vector with more than
 caller-controlled allocation hint.
 
 `ecollab/lib0` is the varint and varstring layer underneath, shared
-with the WebSocket envelope and the archive's chunk records.
+with the WebSocket envelope and the archive's chunk records below.
+
+## The wire codecs
+
+Two byte formats the service speaks that are not the document tree
+and not the vocabulary. Each is the specification of a format a
+program outside the service has to read or write, which is why they
+are here rather than in it.
+
+### The WebSocket envelope
+
+`ecollab/envelope` is the multiplexed frame format a browser client
+speaks over one WebSocket:
+
+```
+varstring doc           // document name; the multiplexing key
+varuint   message_type
+bytes     payload       // type-specific
+```
+
+The doc name is what lets one socket carry any number of documents,
+and the layout follows Hocuspocus / y-protocols so an existing
+in-browser Yjs client interoperates unchanged. The package encodes
+and decodes every frame type in both directions — sync step 1 and 2,
+updates and seed-tagged updates, awareness, the `Synced` handshake,
+`Close`, stateless events, the server ping, the auth refresh and the
+subscribe options — so the protocol is what round-trips through it.
+
+Server-side clients do not need it: the `Collaborate` bidirectional
+stream carries the same messages as protobuf. The envelope is the
+browser half of that pair, and the service converts between the two
+in one file.
+
+### The archive record codec
+
+`ecollab/archive` decodes a session's archived updates straight out
+of object storage, for an audit or forensic reader that would
+otherwise go through the service's RPCs:
+
+```go
+records, err := archive.DecodeRecords(chunkBody)
+```
+
+A chunk body is the concatenation of records, one per archived stream
+entry, carrying the Redis id, the receive timestamp, the originating
+subscription, the `ecollab.Encoding` tag and the payload. Chunk
+numbers increase monotonically per session, so a session reads in
+order by walking the chunks in name order. A truncated body yields
+the records that did decode plus `lib0.ErrTruncated`, so a chunk cut
+short costs a reader the tail rather than the object.
+
+The format is stable and a record is the only part of the archive
+that is a contract: the prefix layout, the `manifest.json` and
+`closed.json` markers, the purge tombstone and the drain policy that
+decides when a chunk is written are the service's own.
 
 ## Development
 

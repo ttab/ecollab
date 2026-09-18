@@ -3,6 +3,7 @@ module github.com/ttab/ecollab
 go 1.27.1
 
 require (
+	connectrpc.com/connect v1.20.0
 	github.com/ttab/elephant-api v0.24.2
 	github.com/ttab/goyjs v0.1.0
 	google.golang.org/protobuf v1.36.12

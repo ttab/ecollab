@@ -6,21 +6,27 @@ collaborative document without being the service.
 
 [collab]: https://github.com/ttab/elephant-collab
 
-It depends on [goyjs][goyjs] and [elephant-api][api] and nothing
-else. goyjs runs yrs as WebAssembly under wazero, so this library is
-pure Go to its consumers: no cgo, no C toolchain, `go build`
-cross-compiles it like anything else.
+It depends on [goyjs][goyjs] and [elephant-api][api], plus
+[connect-go][connect] for the generated client the `Collaborate`
+client drives, and nothing else. goyjs runs yrs as WebAssembly under
+wazero, so this library is pure Go to its consumers: no cgo, no C
+toolchain, `go build` cross-compiles it like anything else.
+
+[connect]: https://connectrpc.com/docs/go/getting-started
 
 [goyjs]: https://github.com/ttab/goyjs
 [api]: https://github.com/ttab/elephant-api
 
 ## Status
 
-Spike-quality, extracted from the service it names, and still
-growing: the tree contract, the presence schema, the named-document
-grammar, the protocol vocabulary and the two wire codecs are here,
-and the `Collaborate` client follows. A `v0.x` tag is honest about
-the surface still moving.
+Spike-quality, extracted from the service it names: the tree
+contract, the presence schema, the named-document grammar, the
+protocol vocabulary, the two wire codecs and the `Collaborate`
+client. A `v0.x` tag is honest about the surface still moving.
+
+The client is the one part that is new code rather than moved code,
+and it is exercised against the real service by elephant-collab's
+own integration tests.
 
 ## The tree contract
 
@@ -324,6 +330,98 @@ caller-controlled allocation hint.
 
 `ecollab/lib0` is the varint and varstring layer underneath, shared
 with the WebSocket envelope and the archive's chunk records below.
+
+## The Collaborate client
+
+`ecollab.Client` is a live editing session from the outside: one
+bidirectional stream carrying any number of document subscriptions,
+each folding the session's updates into a Y.Doc of its own.
+
+```go
+c, err := ecollab.Dial(ctx, endpoint, ecollab.HTTP2Client(),
+	ecollab.WithTokenSource(tokens))
+if err != nil {
+	return err
+}
+defer c.Close()
+
+sub, err := c.Subscribe(ctx, docID, ecollab.Observer())
+if err != nil {
+	return err
+}
+
+doc, err := sub.NewsDoc() // Materialize, on demand
+```
+
+`Subscribe` returns once the server has finished initial state
+transfer, so the document is readable with no further waiting: the
+Step 2 diff against the state vector the subscribe carried has been
+applied, and the granted `Mode` is known. `Update` mutates the local
+document and forwards what the mutation produced; `Seed` is the same
+thing tagged as structural seeding rather than authorship. `Read`
+and `NewsDoc` are how the document is read — the stream's writer is
+holding the same lock, so the Y.Doc itself never escapes.
+
+### It needs HTTP/2, and that is easy to get wrong
+
+connect-go answers a bidirectional stream that arrived over HTTP/1.1
+with a bare `505 HTTP Version Not Supported`, before any handler
+runs, and Go only negotiates HTTP/2 through the TLS ALPN handshake.
+A client talking to a plain-HTTP endpoint — a pod on the cluster
+network, a local instance, a test server — therefore gets HTTP/1.1
+and a 505 unless it asks for unencrypted HTTP/2 explicitly:
+
+```go
+var t http.Transport
+
+t.Protocols = new(http.Protocols)
+t.Protocols.SetHTTP2(true)
+t.Protocols.SetUnencryptedHTTP2(true)
+```
+
+`ecollab.HTTP2Transport` and `ecollab.HTTP2Client` are exactly that,
+and they leave HTTP/1.1 out rather than keeping it as a fallback:
+falling back is what produces the 505, so a transport that cannot
+reach the stream should fail at the connection instead. The same
+requirement reaches the network in front of the pod — an ingress
+that does not forward HTTP/2 makes the transport unusable, and
+browsers cannot use it at all, which is why the WebSocket exists.
+
+### Authorization
+
+With a `TokenSource` the client owns the connection's authorization:
+the stream opens with the source's current token, and a fresh one is
+sent as an `auth_refresh` before the current one expires, which is
+what keeps a long session from dropping mid-edit. The refreshed
+token must be for the same subject — the service counts a refresh
+for a different one and drops it. Without a source the HTTP client
+carries the bearer and the connection ends when it expires;
+`Client.Refresh` is then the caller's to call.
+
+### Errors carry the reason
+
+Two shapes, and `ecollab.Reason` reads both:
+
+- `*CloseError` is the server closing **one** subscription, leaving
+  the stream and its other documents alone. It is what a refused
+  `Subscribe` returns, and what `Subscription.Err` holds after the
+  session was frozen or evicted.
+- `*StreamError` is how the stream itself ended: a connection-wide
+  refusal is the stream's status rather than a message on it,
+  because a Connect stream has one. `Code` is shared between
+  reasons — `rate_limited` and `subscription_limit` are both
+  `resource_exhausted` — so `Reason` is what to branch on.
+
+A clean half-close is not an error: `Close` and `Err` report `nil`.
+
+### Freeze-snapshotting what you see
+
+`Client.LastServerPing` is the service's most recent time witness,
+kept verbatim. Echo it as `SnapshotRequest.client_last_server_ping`
+and the service can tell whether this client had seen everything it
+had; reformatting the string is how a client fails that check, so it
+travels as it arrived. The state vector half of the same check is
+`Subscription.StateVector`.
 
 ## The wire codecs
 

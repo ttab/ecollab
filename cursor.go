@@ -241,15 +241,25 @@ func (r *CursorReader) Cursors(a *goyjs.Awareness) ([]Cursor, error) {
 
 // Editing reports whether end — one end of a resolved cursor, or any
 // other resolved position — points into the value application appID
-// holds for field on this owner. It is the answer to "is this peer in
-// the block I am about to edit", asked per block against the caret
-// read out of awareness.
+// holds for field on this owner, or into anything nested inside it.
+// It is the answer to "is this peer in the block I am about to edit",
+// asked per block against the caret read out of awareness.
+//
+// The nesting is the point. An editor stores a field as a Y.XmlText
+// whose delta is a sequence of embedded paragraph blocks, and a caret
+// resolves into the innermost type it lies in — the paragraph, or an
+// inline node inside the paragraph — never into the field itself. So
+// the question is containment, goyjs.Value.Holds over the field's
+// value, not identity against the field's node.
 //
 // It is false when the owner has no such field, when the field holds
-// something that is not a rich value, and when the position landed in
-// a different type. A peer whose selection spans two blocks has its
-// two ends in different values, so a caller that must not touch
-// either asks about both.
+// no rich value, and when the position landed anywhere outside the
+// field. An editor bound to one field publishes both ends of a
+// selection against that field, so a selection is inside one value
+// whichever paragraphs it spans, and either end answers for it; a
+// caller that must leave the whole selection alone at the paragraph
+// level walks the field's delta from the block holding one end to the
+// block holding the other.
 func (c *Collab) Editing(
 	t *goyjs.ReadTxn, appID, field string, end goyjs.Resolved,
 ) bool {
@@ -257,12 +267,12 @@ func (c *Collab) Editing(
 		return false
 	}
 
-	node, ok := c.FieldNode(t, appID, field)
+	v, ok := c.Field(t, appID, field)
 	if !ok {
 		return false
 	}
 
-	return node.Same(end.Node)
+	return v.Holds(end.Node)
 }
 
 // isNull reports whether raw is the JSON null literal, which is what

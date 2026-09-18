@@ -320,11 +320,23 @@ at the position, and this package is only the common envelope around
 it.
 
 `Editing` is the question asked per block: does this end of the caret
-point into the value that application holds for that field here. It
-is false for a value of another application, for a field the owner
-does not have, and for a position that landed anywhere else. A
-selection spanning two blocks has its ends in different values, so a
-program that must not touch either asks about both.
+point into the value that application holds for that field here, or
+into anything nested inside it. The nesting is the whole question. A
+field is a `Y.XmlText` of embedded paragraph blocks, and a caret
+resolves into the innermost type it lies in — the paragraph, or an
+inline node inside the paragraph — so the resolved `Node` is never the
+field's, and `Editing` asks `goyjs.Value.Holds` of the field's value
+rather than `Node.Same` of its node. It is false for a value of
+another application, for a field the owner does not have, and for a
+position that landed anywhere outside the field.
+
+An editor bound to one field publishes both ends of a selection
+against that field, so a selection is inside one value whichever
+paragraphs it spans, and either end marks the field as busy. A
+program that works below the field — leaving alone the paragraphs a
+selection covers rather than the field — finds them as the embeds
+between the block holding one end and the block holding the other in
+the field's delta; `Editing` does not do that walk.
 
 ### Holding a place while you think
 

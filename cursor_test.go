@@ -31,17 +31,16 @@ func hydratedDoc(t *testing.T) *goyjs.Doc {
 	return doc
 }
 
-// caretIn returns a collapsed caret at index in a block's editable
-// body, as the editor would take one.
+// caretIn returns a collapsed caret at index in the paragraph of a
+// block's editable body, as the editor would take one: the caret is in
+// the paragraph the text is in, not in the field that embeds it.
 func caretIn(t *testing.T, doc *goyjs.Doc, block, index int) goyjs.Range {
 	t.Helper()
-
-	body := bodyNode(t, doc, block)
 
 	read := doc.NewReadTxn()
 	defer read.Commit()
 
-	pos, err := body.Position(read, index, goyjs.AssocAfter)
+	pos, err := paragraphOf(t, doc, read, block).Node().Position(read, index, goyjs.AssocAfter)
 	if err != nil {
 		t.Fatalf("take a position in block %d: %v", block, err)
 	}

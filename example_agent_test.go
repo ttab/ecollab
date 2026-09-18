@@ -31,6 +31,16 @@ import (
 // around the words the agent chose, several characters further along
 // than where it first found them.
 //
+// The shape of the editable value matters to every step, so the file
+// uses the one an editor built on @slate-yjs/core stores: a field is a
+// Y.XmlText whose delta is a sequence of embedded paragraph blocks,
+// each a Y.XmlText of its own carrying its properties as node
+// attributes and its text in its own delta. The text a person types,
+// and the caret they publish, are in the paragraph, not in the field -
+// which is why the agent asks whether the field holds the caret rather
+// than whether it is the caret's type, and why it takes its ranges and
+// writes its formatting in the paragraph.
+//
 // The analysis here is a fixed-string search. A real agent would put
 // a model behind that step and nothing else about the shape would
 // change: what it produces is a range and a thread id, and the range
@@ -75,9 +85,10 @@ func TestAgentHoldsItsRangeWhileTheHumansType(t *testing.T) {
 	}
 
 	// 2. The editing application hydrates an editable YXmlText per
-	//    block under _collab. The agent does not do this - it is the
-	//    authoring application's protocol - but a test has to stand in
-	//    for the editor that would have done it.
+	//    block under _collab, one embedded paragraph block per line of
+	//    text. The agent does not do this - it is the authoring
+	//    application's protocol - but a test has to stand in for the
+	//    editor that would have done it.
 	hydrateAsTheEditorWould(t, doc)
 
 	// 3. Two other participants, each with their own document: the
@@ -87,8 +98,8 @@ func TestAgentHoldsItsRangeWhileTheHumansType(t *testing.T) {
 	colleagueDoc := replicaOf(t, doc)
 
 	// 4. The human's editor publishes the caret. It is a pair of
-	//    relative positions against the YXmlText the editor is bound
-	//    to, wrapped in the envelope the editor chooses - here
+	//    relative positions against the paragraph the caret is in,
+	//    wrapped in the envelope the editor chooses - here
 	//    @slate-yjs/core's, which is what CursorReader reads by
 	//    default.
 	human := goyjs.NewAwareness(humanClient)
@@ -136,7 +147,7 @@ func TestAgentHoldsItsRangeWhileTheHumansType(t *testing.T) {
 	// offset the agent first computed. An agent that had held that
 	// offset would have commented on the wrong words.
 	for _, p := range plans {
-		got := renderBlock(t, doc, p.block)
+		got := renderParagraph(t, doc, p.block)
 
 		t.Logf("block %d -> %s", p.block, got)
 
@@ -166,7 +177,7 @@ func TestAgentHoldsItsRangeWhileTheHumansType(t *testing.T) {
 
 	// The block the human is editing is untouched: no comment, and the
 	// text is exactly as it was.
-	busyText := renderBlock(t, doc, busyBlock)
+	busyText := renderParagraph(t, doc, busyBlock)
 
 	if strings.Contains(busyText, "<comment") {
 		t.Errorf("the agent annotated the block the human is editing: %q", busyText)
@@ -178,7 +189,7 @@ func TestAgentHoldsItsRangeWhileTheHumansType(t *testing.T) {
 }
 
 // plan is one annotation the agent has decided on: the block, the
-// value it lives in, and the run of text to comment on - held as a
+// paragraph it lives in, and the run of text to comment on - held as a
 // range, so that it survives whatever the humans do next.
 type plan struct {
 	block int
@@ -195,6 +206,13 @@ type plan struct {
 // and reports which blocks they are in. A caret that resolves into a
 // value the agent cannot place - another application's field, a value
 // that has since been deleted - simply does not mark a block.
+//
+// The caret resolves into the paragraph the person is typing in, so
+// the question per block is whether the block's field holds that
+// paragraph, which is what Editing asks. Both ends are asked about:
+// an editor publishes both against the field it is bound to, so for a
+// selection inside one field either would do, and asking about both
+// costs nothing.
 func blocksBeingEdited(
 	t *testing.T, doc *goyjs.Doc, a *goyjs.Awareness,
 ) map[int]struct{} {
@@ -237,9 +255,10 @@ func blocksBeingEdited(
 }
 
 // decideWhatToAnnotate is the agent's own work: for every block no
-// peer is in, find the phrase and take a range over it. The ranges are
-// taken under one read transaction, so they all describe the same
-// document state, and they stay true for every state after it.
+// peer is in, find the phrase in one of its paragraphs and take a
+// range over it. The ranges are taken under one read transaction, so
+// they all describe the same document state, and they stay true for
+// every state after it.
 func decideWhatToAnnotate(
 	t *testing.T, doc *goyjs.Doc, busy map[int]struct{},
 ) []plan {
@@ -255,40 +274,50 @@ func decideWhatToAnnotate(
 			return
 		}
 
-		body, ok := ecollab.CollabOn(block.Map()).FieldNode(read, editorApp, bodyField)
+		field, ok := ecollab.CollabOn(block.Map()).Field(read, editorApp, bodyField)
 		if !ok {
 			return
 		}
 
-		value, ok := body.Value(read)
-		if !ok {
+		// The text is in the paragraphs the field embeds, one per run
+		// of its delta, and so is the range: a paragraph is the value
+		// the phrase is in, and the value the comment is written
+		// through.
+		for _, run := range field.Delta() {
+			if run.Embed == nil || run.Embed.Kind() != goyjs.KindXMLText {
+				continue
+			}
+
+			paragraph := *run.Embed
+
+			// The analysis step. A real agent reasons over the text
+			// here; what it has to come back with is an offset and a
+			// length, and those are in UTF-16 code units because that
+			// is how yjs counts - which is why the offset is
+			// accumulated with UTF16Len rather than with len().
+			offset, found := findRun(paragraph, phrase)
+			if !found {
+				continue
+			}
+
+			// The offset is turned into a range immediately, while the
+			// document it was computed from is still the document.
+			// From here on the agent carries the range and nothing
+			// else.
+			span, err := paragraph.Node().Range(read, offset, goyjs.UTF16Len(phrase))
+			if err != nil {
+				t.Fatalf("hold the run in block %d: %v", i, err)
+			}
+
+			plans = append(plans, plan{
+				block:       i,
+				node:        paragraph.Node(),
+				span:        span,
+				staleOffset: offset,
+			})
+
 			return
 		}
-
-		// The analysis step. A real agent reasons over the text here;
-		// what it has to come back with is an offset and a length, and
-		// those are in UTF-16 code units because that is how yjs
-		// counts - which is why the offset is accumulated with
-		// UTF16Len rather than with len().
-		offset, found := findRun(value, phrase)
-		if !found {
-			return
-		}
-
-		// The offset is turned into a range immediately, while the
-		// document it was computed from is still the document. From
-		// here on the agent carries the range and nothing else.
-		span, err := body.Range(read, offset, goyjs.UTF16Len(phrase))
-		if err != nil {
-			t.Fatalf("hold the run in block %d: %v", i, err)
-		}
-
-		plans = append(plans, plan{
-			block:       i,
-			node:        body,
-			span:        span,
-			staleOffset: offset,
-		})
 	})
 
 	return plans
@@ -327,9 +356,9 @@ func attachComments(t *testing.T, doc *goyjs.Doc, plans []plan) map[int]int {
 			}
 
 			// The value the range resolved into is the value to write
-			// through. It is the same node the agent read, and saying
-			// so is how an agent that kept a handle checks that it is
-			// still the right one.
+			// through. It is the same paragraph the agent read, and
+			// saying so is how an agent that kept a handle checks that
+			// it is still the right one.
 			node := resolved.Anchor.Node
 			if !p.node.Same(node) {
 				return fmt.Errorf("block %d: the run moved to another value", p.block)
@@ -354,20 +383,19 @@ func attachComments(t *testing.T, doc *goyjs.Doc, plans []plan) map[int]int {
 }
 
 // publishCaret stands in for the editor's withCursors binding: it
-// takes a relative position in the value the editor is bound to and
+// takes a relative position in the paragraph the caret is in and
 // publishes it into awareness, under the field names @slate-yjs/core
-// uses. A collapsed caret is the same position twice.
+// uses. A collapsed caret is the same position twice, and slate-yjs
+// anchors a caret inside a text run AssocAfter, as this does.
 func publishCaret(
 	t *testing.T, a *goyjs.Awareness, doc *goyjs.Doc, block, index int,
 ) {
 	t.Helper()
 
-	body := bodyNode(t, doc, block)
-
 	read := doc.NewReadTxn()
 	defer read.Commit()
 
-	pos, err := body.Position(read, index, goyjs.AssocAfter)
+	pos, err := paragraphOf(t, doc, read, block).Node().Position(read, index, goyjs.AssocAfter)
 	if err != nil {
 		t.Fatalf("take the caret position in block %d: %v", block, err)
 	}
@@ -388,16 +416,14 @@ func publishCaret(
 	}
 }
 
-// theColleagueTypes inserts at the start of a block on the
+// theColleagueTypes inserts at the start of a block's paragraph on the
 // colleague's own document, which is where the concurrent edit comes
 // from: their client, not the agent's.
 func theColleagueTypes(t *testing.T, doc *goyjs.Doc, block int) {
 	t.Helper()
 
-	body := bodyNode(t, doc, block)
-
 	err := doc.Write(func(w *goyjs.WriteTxn) error {
-		body.Insert(w, 0, typed)
+		paragraphOf(t, doc, w.ReadTxn(), block).Node().Insert(w, 0, typed)
 
 		return nil
 	})
@@ -434,10 +460,10 @@ func findRun(v goyjs.Value, needle string) (int, bool) {
 
 // hydrateAsTheEditorWould stands in for the editing application, which
 // creates the editable YXmlText for each block under _collab and copies
-// the NewsDoc text into it. EnsureField creates every level that is
-// missing and leaves an existing value alone, so the editor and the
-// agent racing to hydrate the same field cannot produce two of them on
-// this document.
+// the NewsDoc text into it in the shape it edits. EnsureField creates
+// every level that is missing and leaves an existing value alone, so
+// the editor and the agent racing to hydrate the same field cannot
+// produce two of them on this document.
 func hydrateAsTheEditorWould(t *testing.T, doc *goyjs.Doc) {
 	t.Helper()
 
@@ -465,9 +491,7 @@ func hydrateAsTheEditorWould(t *testing.T, doc *goyjs.Doc) {
 			}
 
 			_, err := ecollab.CollabOn(m).EnsureField(w, editorApp, bodyField,
-				goyjs.XMLTextValue(nil, goyjs.Delta{
-					goyjs.Insert(text.String(), nil),
-				}))
+				richText(text.String()))
 			if err != nil {
 				ferr = err
 
@@ -482,6 +506,32 @@ func hydrateAsTheEditorWould(t *testing.T, doc *goyjs.Doc) {
 	if err != nil {
 		t.Fatalf("hydrate the editable state: %v", err)
 	}
+}
+
+// richText is a field as an editor built on @slate-yjs/core stores it:
+// a Y.XmlText whose delta is one embedded core/text block per
+// paragraph, each carrying its properties as node attributes and the
+// paragraph's text in its own delta. A bare text run at the root of
+// the field is not a shape such an editor accepts, so nothing here
+// produces one.
+func richText(text string) goyjs.Input {
+	lines := strings.Split(text, "\n")
+	delta := make(goyjs.Delta, 0, len(lines))
+
+	for _, line := range lines {
+		var runs goyjs.Delta
+		if line != "" {
+			runs = goyjs.Delta{goyjs.Insert(line, nil)}
+		}
+
+		delta = append(delta, goyjs.Embed(goyjs.XMLTextValue(goyjs.Attrs{
+			"type":       goyjs.String("core/text"),
+			"class":      goyjs.String("text"),
+			"properties": goyjs.JSONMap(map[string]goyjs.Input{}),
+		}, runs), nil))
+	}
+
+	return goyjs.XMLTextValue(nil, delta)
 }
 
 // replicaOf returns a second document holding what doc holds: another
@@ -529,12 +579,10 @@ func forEachBlock(
 	})
 }
 
-// bodyNode returns the editable body of a block.
-func bodyNode(t *testing.T, doc *goyjs.Doc, index int) *goyjs.Node {
+// fieldOf returns the editable field of a block under the caller's
+// transaction.
+func fieldOf(t *testing.T, doc *goyjs.Doc, read *goyjs.ReadTxn, index int) goyjs.Value {
 	t.Helper()
-
-	read := doc.NewReadTxn()
-	defer read.Commit()
 
 	blocks, ok := doc.Map(ecollab.RootName).Get(read, "content")
 	if !ok {
@@ -546,37 +594,37 @@ func bodyNode(t *testing.T, doc *goyjs.Doc, index int) *goyjs.Node {
 		t.Fatalf("no block at index %d", index)
 	}
 
-	body, ok := ecollab.CollabOn(block.Map()).FieldNode(read, editorApp, bodyField)
+	field, ok := ecollab.CollabOn(block.Map()).Field(read, editorApp, bodyField)
 	if !ok {
 		t.Fatalf("block %d has no editable body", index)
 	}
 
-	return body
+	return field
 }
 
-// renderBlock returns the rendered XML of a block's editable body.
-func renderBlock(t *testing.T, doc *goyjs.Doc, index int) string {
+// paragraphOf returns the first paragraph of a block's editable field:
+// the value the text is in, and the one a caret in the block resolves
+// into.
+func paragraphOf(t *testing.T, doc *goyjs.Doc, read *goyjs.ReadTxn, index int) goyjs.Value {
+	t.Helper()
+
+	runs := fieldOf(t, doc, read, index).Delta()
+	if len(runs) == 0 || runs[0].Embed == nil || runs[0].Embed.Kind() != goyjs.KindXMLText {
+		t.Fatalf("block %d has no paragraph", index)
+	}
+
+	return *runs[0].Embed
+}
+
+// renderParagraph returns the rendered XML of a block's first
+// paragraph.
+func renderParagraph(t *testing.T, doc *goyjs.Doc, index int) string {
 	t.Helper()
 
 	read := doc.NewReadTxn()
 	defer read.Commit()
 
-	blocks, ok := doc.Map(ecollab.RootName).Get(read, "content")
-	if !ok {
-		t.Fatal("the document has no content blocks")
-	}
-
-	block, ok := blocks.Array().Get(read, index)
-	if !ok {
-		t.Fatalf("no block at index %d", index)
-	}
-
-	value, ok := ecollab.CollabOn(block.Map()).Field(read, editorApp, bodyField)
-	if !ok {
-		t.Fatalf("block %d has no editable body", index)
-	}
-
-	s, _ := value.RichString()
+	s, _ := paragraphOf(t, doc, read, index).RichString()
 
 	return s
 }

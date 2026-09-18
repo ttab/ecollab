@@ -3,6 +3,7 @@ package ecollab_test
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ttab/ecollab"
@@ -345,5 +346,88 @@ func replaceField(t *testing.T, doc *goyjs.Doc, block int) {
 	})
 	if err != nil {
 		t.Fatalf("replace the value: %v", err)
+	}
+}
+
+// TestResolveKeepsTheEndThatIsStillThere: a selection from one value
+// into another, and the other gone. The end that is still there says
+// where the peer is; the end that is gone is reported as gone, not as
+// the whole cursor failing.
+func TestResolveKeepsTheEndThatIsStillThere(t *testing.T) {
+	doc := hydratedDoc(t)
+
+	c := ecollab.Cursor{
+		ClientID: 1001,
+		Range: goyjs.Range{
+			Anchor: caretIn(t, doc, 0, 5).Anchor,
+			Focus:  caretIn(t, doc, 1, 3).Focus,
+		},
+	}
+
+	replaceField(t, doc, 1)
+
+	resolved, err := c.Resolve(doc, nil)
+	if err != nil {
+		t.Fatalf("resolving a selection with one end gone: %v", err)
+	}
+
+	if resolved.AnchorGone || !resolved.FocusGone {
+		t.Errorf("gone anchor %v, focus %v; want the focus gone and the anchor there",
+			resolved.AnchorGone, resolved.FocusGone)
+	}
+
+	if ends := resolved.Ends(); len(ends) != 1 || ends[0].Offset != 5 {
+		t.Errorf("Ends = %+v, want the anchor alone at offset 5", ends)
+	}
+
+	if _, _, same := resolved.Range.Span(); same {
+		t.Error("a selection with one end gone spans nothing")
+	}
+
+	if !editingBlock(t, doc, 0, resolved.Range.Anchor) || editingBlock(t, doc, 1, resolved.Range.Focus) {
+		t.Error("the anchor marks block 0 and the gone focus marks nothing")
+	}
+
+	// Both ends gone is the cursor gone.
+	replaceField(t, doc, 0)
+
+	if _, err := c.Resolve(doc, nil); !errors.Is(err, goyjs.ErrStaleNode) {
+		t.Errorf("resolving a selection with both ends gone gave %v, want ErrStaleNode", err)
+	}
+}
+
+// TestCursorsReturnWhatTheyCouldRead: one participant whose state is
+// not an object costs the caller that participant, not the room, and
+// the error names the client.
+func TestCursorsReturnWhatTheyCouldRead(t *testing.T) {
+	doc := hydratedDoc(t)
+
+	agent := goyjs.NewAwareness(2002)
+
+	hanna := goyjs.NewAwareness(1001)
+	if err := hanna.SetLocalStateField(ecollab.DefaultCursorField, caretIn(t, doc, 1, 2)); err != nil {
+		t.Fatalf("publish the caret: %v", err)
+	}
+
+	odd := goyjs.NewAwareness(3003)
+	if err := odd.SetLocalState("gone fishing"); err != nil {
+		t.Fatalf("publish the odd state: %v", err)
+	}
+
+	for _, peer := range []*goyjs.Awareness{hanna, odd} {
+		if err := agent.ApplyUpdate(peer.Encode(), nil); err != nil {
+			t.Fatalf("apply the awareness of client %d: %v", peer.ClientID(), err)
+		}
+	}
+
+	cursors, err := ecollab.NewCursorReader().Cursors(agent)
+	if err == nil {
+		t.Error("a state that is not an object was read without error")
+	} else if !strings.Contains(err.Error(), "3003") {
+		t.Errorf("the error %q does not name the client it could not read", err)
+	}
+
+	if len(cursors) != 1 || cursors[0].ClientID != 1001 {
+		t.Errorf("read %d carets (%+v), want the one readable caret", len(cursors), cursors)
 	}
 }

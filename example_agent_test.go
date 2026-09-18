@@ -209,10 +209,16 @@ type plan struct {
 //
 // The caret resolves into the paragraph the person is typing in, so
 // the question per block is whether the block's field holds that
-// paragraph, which is what Editing asks. Both ends are asked about:
-// an editor publishes both against the field it is bound to, so for a
-// selection inside one field either would do, and asking about both
-// costs nothing.
+// paragraph, which is what Editing asks. It is asked of every end
+// that resolved: an editor publishes both against the field it is
+// bound to, so for a selection inside one field either would do, and
+// a selection whose other end is in a paragraph a peer has deleted
+// still has this one.
+//
+// Cursors returns the carets it could read alongside an error for the
+// states it could not; a real agent logs the error and works with the
+// carets, and a test fails, because a state it cannot read is a bug
+// in the test.
 func blocksBeingEdited(
 	t *testing.T, doc *goyjs.Doc, a *goyjs.Awareness,
 ) map[int]struct{} {
@@ -233,9 +239,9 @@ func blocksBeingEdited(
 
 		switch {
 		case errors.Is(err, goyjs.ErrStaleNode):
-			// The value this peer was editing is gone. That is an
-			// ordinary outcome of concurrent editing and not a reason
-			// to stop reading the others.
+			// Both values this peer's selection was in are gone. That
+			// is an ordinary outcome of concurrent editing and not a
+			// reason to stop reading the others.
 			continue
 		case err != nil:
 			t.Fatalf("resolve the caret of client %d: %v", c.ClientID, err)
@@ -244,9 +250,10 @@ func blocksBeingEdited(
 		forEachBlock(t, doc, read, func(i int, block goyjs.Value) {
 			collab := ecollab.CollabOn(block.Map())
 
-			if collab.Editing(read, editorApp, bodyField, resolved.Range.Anchor) ||
-				collab.Editing(read, editorApp, bodyField, resolved.Range.Focus) {
-				busy[i] = struct{}{}
+			for _, end := range resolved.Ends() {
+				if collab.Editing(read, editorApp, bodyField, end) {
+					busy[i] = struct{}{}
+				}
 			}
 		})
 	}

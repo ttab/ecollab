@@ -3,6 +3,7 @@ package ecollab
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -54,31 +55,80 @@ type Cursor struct {
 
 // Resolve maps the caret onto doc as the transaction sees it: the
 // shared type each end points into, and the offset in it now. t may
-// be nil, as for every goyjs read.
+// be nil, as for every goyjs read; each end is then resolved under a
+// hold of its own, and a write can land between the two, so a caller
+// reading the document under a transaction passes it.
 //
-// The errors are goyjs.Doc.ResolveRange's, and the two a caller acts
-// on differently are goyjs.ErrStaleNode — the value the peer was
-// editing is gone, which is an ordinary outcome of concurrent
-// editing — and goyjs.ErrPositionUnseen, which means the peer is
-// ahead of this document and the answer is to sync and resolve
-// again, not to discard the cursor.
+// The two ends are resolved on their own, because a selection can
+// have one end in a value a peer has since deleted and the other in a
+// value that is still there - a selection from one paragraph into the
+// next, and the next paragraph gone. The end that resolved is
+// returned, the end whose value is gone is the zero goyjs.Resolved with
+// AnchorGone or FocusGone set, and the caller still learns which value
+// the peer is in.
+//
+// The errors are goyjs.Doc.Resolve's, and the two a caller acts on
+// differently are goyjs.ErrStaleNode - both ends' values are gone,
+// which is an ordinary outcome of concurrent editing - and
+// goyjs.ErrPositionUnseen, which means the peer is ahead of this
+// document and the answer is to sync and resolve again, not to
+// discard the cursor. An unseen end takes precedence: the sync it asks
+// for is what settles the other end too.
 func (c Cursor) Resolve(doc *goyjs.Doc, t *goyjs.ReadTxn) (ResolvedCursor, error) {
-	r, err := doc.ResolveRange(t, c.Range)
+	r := ResolvedCursor{ClientID: c.ClientID, Data: c.Data}
+
+	var anchorErr, focusErr error
+
+	r.Range.Anchor, anchorErr = doc.Resolve(t, c.Range.Anchor)
+	r.Range.Focus, focusErr = doc.Resolve(t, c.Range.Focus)
+
+	r.AnchorGone = anchorErr != nil && errors.Is(anchorErr, goyjs.ErrStaleNode)
+	r.FocusGone = focusErr != nil && errors.Is(focusErr, goyjs.ErrStaleNode)
+
+	// One end gone and the other resolved is an answer: the end that
+	// is there says where the peer is.
+	if r.AnchorGone && focusErr == nil {
+		r.Range.Anchor = goyjs.Resolved{}
+
+		return r, nil
+	}
+
+	if r.FocusGone && anchorErr == nil {
+		r.Range.Focus = goyjs.Resolved{}
+
+		return r, nil
+	}
+
+	err := cursorError(anchorErr, focusErr)
 	if err != nil {
 		return ResolvedCursor{}, fmt.Errorf(
 			"resolve the cursor of client %d: %w", c.ClientID, err)
 	}
 
-	return ResolvedCursor{
-		ClientID: c.ClientID,
-		Range:    r,
-		Data:     c.Data,
-	}, nil
+	return r, nil
+}
+
+// cursorError picks the error a cursor with a failed end reports:
+// nil when both resolved, an unseen end before anything else, then
+// the anchor's before the focus's.
+func cursorError(anchorErr, focusErr error) error {
+	switch {
+	case anchorErr == nil && focusErr == nil:
+		return nil
+	case anchorErr != nil && errors.Is(anchorErr, goyjs.ErrPositionUnseen):
+		return anchorErr
+	case focusErr != nil && errors.Is(focusErr, goyjs.ErrPositionUnseen):
+		return focusErr
+	case anchorErr != nil:
+		return anchorErr
+	default:
+		return focusErr
+	}
 }
 
 // ResolvedCursor is a Cursor mapped onto a document: which shared
 // type the peer is editing, and where in it. It is true for the
-// transaction it was resolved under and no longer — the peer is
+// transaction it was resolved under and no longer - the peer is
 // still typing.
 type ResolvedCursor struct {
 	// ClientID is the Yjs client the caret belongs to.
@@ -86,11 +136,38 @@ type ResolvedCursor struct {
 
 	// Range holds both ends, each with the kind of the type it
 	// points into, a handle to it and the offset in it. Span answers
-	// the ordered extent when both ends landed in the same type.
+	// the ordered extent when both ends landed in the same type. An
+	// end whose value is gone is the zero goyjs.Resolved - no Kind,
+	// no handle - and AnchorGone or FocusGone says so; Span then
+	// reports ok == false, and Collab.Editing is false for that end.
 	Range goyjs.ResolvedRange
+
+	// AnchorGone and FocusGone report an end whose value has been
+	// deleted or replaced while the other end resolved. Both gone is
+	// goyjs.ErrStaleNode from Resolve, never a ResolvedCursor.
+	AnchorGone bool
+	FocusGone  bool
 
 	// Data is Cursor.Data, carried through.
 	Data json.RawMessage
+}
+
+// Ends returns the ends that resolved, anchor first: both for a
+// selection whose values are still there, one when the other's is
+// gone. It is what a caller that asks per value "is this peer here"
+// iterates over.
+func (r ResolvedCursor) Ends() []goyjs.Resolved {
+	ends := make([]goyjs.Resolved, 0, 2)
+
+	if !r.AnchorGone {
+		ends = append(ends, r.Range.Anchor)
+	}
+
+	if !r.FocusGone {
+		ends = append(ends, r.Range.Focus)
+	}
+
+	return ends
 }
 
 // CursorReader reads carets out of awareness states. The envelope an
@@ -204,11 +281,19 @@ func (r *CursorReader) Cursor(
 }
 
 // Cursors reads the carets of every participant in a but the local
-// client, ordered by client ID. A participant with no caret is left
-// out; a state that cannot be read is an error, so a reader that has
-// drifted from the editor is not mistaken for an empty room. The
-// states are read in client order, so which error that is does not
-// depend on map iteration.
+// client, ordered by client ID, and returns every caret it could read
+// together with an error joining every state it could not - a state
+// that is not a JSON object, an envelope with no anchor and focus
+// pair, a position neither Yjs encoding produces. One foreign or
+// broken peer therefore costs a caller that peer's caret and not the
+// room: act on the carets returned, and log the error, which names
+// each client it could not read.
+//
+// A participant whose state carries no caret field, or a null one, is
+// not an error and not a caret: it is a participant who is present and
+// has no selection. That is also what a reader told the wrong field
+// name sees of everybody, silently, which is why the default names are
+// held to the editor library that writes them rather than assumed.
 func (r *CursorReader) Cursors(a *goyjs.Awareness) ([]Cursor, error) {
 	states := a.States()
 
@@ -226,10 +311,14 @@ func (r *CursorReader) Cursors(a *goyjs.Awareness) ([]Cursor, error) {
 
 	out := make([]Cursor, 0, len(clients))
 
+	var errs []error
+
 	for _, clientID := range clients {
 		c, ok, err := r.Cursor(clientID, states[clientID])
 		if err != nil {
-			return nil, err
+			errs = append(errs, err)
+
+			continue
 		}
 
 		if !ok {
@@ -239,7 +328,7 @@ func (r *CursorReader) Cursors(a *goyjs.Awareness) ([]Cursor, error) {
 		out = append(out, c)
 	}
 
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 // Editing reports whether end — one end of a resolved cursor, or any

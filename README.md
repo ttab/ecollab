@@ -281,30 +281,42 @@ they are editing and where in it:
 ```go
 cursors, err := ecollab.NewCursorReader().Cursors(awareness)
 if err != nil {
-    return fmt.Errorf("read the peers' carets: %w", err)
+    log.Printf("some carets could not be read: %v", err) // and go on with the rest
 }
 
 for _, c := range cursors {
     resolved, err := c.Resolve(yDoc, read)
     if errors.Is(err, goyjs.ErrStaleNode) {
-        continue // the value that peer was editing is gone
+        continue // both values that peer's selection was in are gone
     }
     if err != nil {
         return fmt.Errorf("resolve a caret: %w", err)
     }
 
-    if collab.Editing(read, appID, "body", resolved.Range.Anchor) {
-        // This peer has the caret in the body of this block.
+    for _, end := range resolved.Ends() {
+        if collab.Editing(read, appID, "body", end) {
+            // This peer has the caret in the body of this block.
+        }
     }
 }
 ```
 
 `Cursors` reads every participant but the local client, ordered by
 client ID, and leaves out the ones with no selection — a `null`
-selection field is a participant who is present and not in a text. A
-state whose envelope is there but cannot be read is an error rather
-than a silent absence: it means the editor and the reader disagree
-about the envelope, which is worth seeing.
+selection field is a participant who is present and not in a text. It
+returns every caret it could read together with an error joining the
+states it could not — one that is not a JSON object, an envelope with
+no anchor and focus pair — so one foreign or broken peer costs a
+program that peer's caret, not the room: act on the carets, log the
+error, which names each client it could not read.
+
+`Resolve` resolves the two ends on their own. A selection can run from
+a paragraph into one a peer has since deleted; the end that is still
+there is returned, the end that is gone is the zero `goyjs.Resolved`
+with `AnchorGone` or `FocusGone` set, and `Ends` is the ends that
+resolved, which is what to ask `Editing` about. Both ends gone is
+`goyjs.ErrStaleNode`; an end the document has not received yet is
+`goyjs.ErrPositionUnseen`, whichever the other end did.
 
 The envelope is the application's choice, so it is the reader's to be
 told. `WithCursorField` and `WithCursorDataField` name the two state

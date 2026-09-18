@@ -1,10 +1,8 @@
 # ecollab
 
-The data library for [elephant-collab][collab], the collaborative
-editing service: everything a program needs to work with a
-collaborative document without being the service.
-
-[collab]: https://github.com/ttab/elephant-collab
+The data library for the Elephant collaborative editing backend:
+everything a program needs to work with a collaborative document
+without being the service that hosts it.
 
 It depends on [goyjs][goyjs] and [elephant-api][api], plus
 [connect-go][connect] for the generated client the `Collaborate`
@@ -19,14 +17,15 @@ toolchain, `go build` cross-compiles it like anything else.
 
 ## Status
 
-Spike-quality, extracted from the service it names: the tree
-contract, the presence schema, the named-document grammar, the
-protocol vocabulary, the two wire codecs and the `Collaborate`
-client. A `v0.x` tag is honest about the surface still moving.
+Early. The version is `v0.x` and the Go API may still change. The
+formats described here cannot change independently of the service that
+speaks them, so they move at its pace rather than this library's.
 
-The client is the one part that is new code rather than moved code,
-and it is exercised against the real service by elephant-collab's
-own integration tests.
+What is here: the tree contract between a Y.Doc and a NewsDoc, the
+presence schema, the named-document grammar, the protocol vocabulary,
+the WebSocket and archive wire codecs, and the `Collaborate` client.
+The client is exercised against a running server by the service's own
+integration tests.
 
 ## The tree contract
 

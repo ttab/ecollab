@@ -17,11 +17,11 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-// The client is exercised against the real server by
-// elephant-collab's integration tests. What is tested here is
-// everything that does not need one: the handshake, the folding of
-// Step 2 and updates into the local document, the two error shapes
-// and the reason they carry, the ping echo, and the token refresh.
+// The client is exercised against a real server by the service's own
+// integration tests. What is tested here is everything that does not
+// need one: the handshake, the folding of Step 2 and updates into the
+// local document, the two error shapes and the reason they carry, the
+// ping echo, and the token refresh.
 
 const (
 	// budget bounds a wait for something the fake stream has already

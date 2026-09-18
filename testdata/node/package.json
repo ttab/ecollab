@@ -1,0 +1,16 @@
+{
+  "name": "ecollab-caret-helper",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Node-side test helper that publishes a caret through a real @slate-yjs/core editor, for ecollab's cursor tests.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@slate-yjs/core": "1.0.2",
+    "slate": "0.126.2",
+    "y-protocols": "1.0.6",
+    "yjs": "13.6.21"
+  }
+}

@@ -11,13 +11,16 @@ import (
 
 // The awareness state fields an editor built on @slate-yjs/core
 // publishes a caret under, which are that library's defaults:
-// `cursor` holds the caret itself and `data` the descriptor drawn
-// beside it — a display name, a colour. Both are the application's
-// choice, so both are options rather than constants in the code
-// path; these are the names to expect when nobody has chosen
-// otherwise.
+// `selection` holds the caret itself — withCursors' cursorStateField —
+// and `data` the descriptor drawn beside it — its cursorDataField — a
+// display name, a colour. Both are the application's choice, so both
+// are options rather than constants in the code path; these are the
+// names to expect when nobody has chosen otherwise, and they are held
+// to the library's release in cursor_slate_test.go rather than to
+// this file, because a reader looking under the wrong name sees an
+// empty room and no error.
 const (
-	DefaultCursorField     = "cursor"
+	DefaultCursorField     = "selection"
 	DefaultCursorDataField = "data"
 )
 

@@ -1,2 +1,5 @@
 # Go test binaries
 *.test
+
+# Node test helper
+/testdata/node/node_modules/

@@ -100,11 +100,11 @@ func TestCursorReaderReadsTheBrowserSpelling(t *testing.T) {
 	caret := caretIn(t, doc, 1, 12)
 
 	raw := state(t, map[string]any{
-		"cursor": map[string]any{
+		ecollab.DefaultCursorField: map[string]any{
 			"anchor": browserSpelling(t, caret.Anchor),
 			"focus":  browserSpelling(t, caret.Focus),
 		},
-		"data": map[string]any{"name": "Hanna"},
+		ecollab.DefaultCursorDataField: map[string]any{"name": "Hanna"},
 	})
 
 	c, ok, err := ecollab.NewCursorReader().Cursor(1001, raw)
@@ -187,7 +187,7 @@ func editingBlock(
 // participant is present without a selection.
 func TestCursorReaderAbsentCaret(t *testing.T) {
 	cases := map[string]json.RawMessage{
-		"null":    json.RawMessage(`{"cursor":null,"data":{"name":"Hanna"}}`),
+		"null":    json.RawMessage(`{"selection":null,"data":{"name":"Hanna"}}`),
 		"missing": json.RawMessage(`{"data":{"name":"Hanna"}}`),
 		"empty":   json.RawMessage(`{}`),
 	}
@@ -214,14 +214,14 @@ func TestCursorReaderRefusesAHalfCaret(t *testing.T) {
 	caret := caretIn(t, doc, 0, 3)
 
 	raw := state(t, map[string]any{
-		"cursor": map[string]any{"anchor": caret.Anchor},
+		ecollab.DefaultCursorField: map[string]any{"anchor": caret.Anchor},
 	})
 
 	if _, _, err := ecollab.NewCursorReader().Cursor(1001, raw); err == nil {
 		t.Error("a caret with no focus was read as a caret")
 	}
 
-	if _, _, err := ecollab.NewCursorReader().Cursor(1001, json.RawMessage(`{"cursor":7}`)); err == nil {
+	if _, _, err := ecollab.NewCursorReader().Cursor(1001, json.RawMessage(`{"selection":7}`)); err == nil {
 		t.Error("a number was read as a caret")
 	}
 }
@@ -233,12 +233,12 @@ func TestCursorReaderFieldNames(t *testing.T) {
 	caret := caretIn(t, doc, 2, 4)
 
 	raw := state(t, map[string]any{
-		"selection": caret,
-		"who":       map[string]any{"name": "Hanna"},
+		"caret": caret,
+		"who":   map[string]any{"name": "Hanna"},
 	})
 
 	reader := ecollab.NewCursorReader(
-		ecollab.WithCursorField("selection"),
+		ecollab.WithCursorField("caret"),
 		ecollab.WithCursorDataField("who"),
 	)
 
@@ -268,14 +268,14 @@ func TestCursorsSkipTheLocalClient(t *testing.T) {
 
 	agent := goyjs.NewAwareness(2002)
 
-	if err := agent.SetLocalStateField("cursor", caretIn(t, doc, 0, 1)); err != nil {
+	if err := agent.SetLocalStateField(ecollab.DefaultCursorField, caretIn(t, doc, 0, 1)); err != nil {
 		t.Fatalf("publish the agent's own caret: %v", err)
 	}
 
 	for _, client := range []uint64{3003, 1001} {
 		peer := goyjs.NewAwareness(client)
 
-		if err := peer.SetLocalStateField("cursor", caretIn(t, doc, 1, 2)); err != nil {
+		if err := peer.SetLocalStateField(ecollab.DefaultCursorField, caretIn(t, doc, 1, 2)); err != nil {
 			t.Fatalf("publish the caret of client %d: %v", client, err)
 		}
 
@@ -308,6 +308,19 @@ func TestResolveAValueThatIsGone(t *testing.T) {
 
 	c := ecollab.Cursor{ClientID: 1001, Range: caret}
 
+	replaceField(t, doc, 0)
+
+	if _, err := c.Resolve(doc, nil); !errors.Is(err, goyjs.ErrStaleNode) {
+		t.Errorf("resolving a caret into a replaced value gave %v, want ErrStaleNode", err)
+	}
+}
+
+// replaceField stands in for a participant whose create of a block's
+// field won over the one everybody else was editing: the old value and
+// every paragraph in it are deleted with it.
+func replaceField(t *testing.T, doc *goyjs.Doc, block int) {
+	t.Helper()
+
 	err := doc.Write(func(w *goyjs.WriteTxn) error {
 		read := w.ReadTxn()
 
@@ -316,27 +329,21 @@ func TestResolveAValueThatIsGone(t *testing.T) {
 			t.Fatal("the document has no content blocks")
 		}
 
-		block, ok := blocks.Array().Get(read, 0)
+		v, ok := blocks.Array().Get(read, block)
 		if !ok {
-			t.Fatal("no block at index 0")
+			t.Fatalf("no block at index %d", block)
 		}
 
-		app, ok := ecollab.CollabOn(block.Map()).App(read, editorApp)
+		app, ok := ecollab.CollabOn(v.Map()).App(read, editorApp)
 		if !ok {
 			t.Fatal("the block has no editor state")
 		}
 
-		app.Set(w, bodyField, goyjs.XMLTextValue(nil, goyjs.Delta{
-			goyjs.Insert("Skrivet på nytt.", nil),
-		}))
+		app.Set(w, bodyField, richText("Skrivet på nytt."))
 
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("replace the value: %v", err)
-	}
-
-	if _, err := c.Resolve(doc, nil); !errors.Is(err, goyjs.ErrStaleNode) {
-		t.Errorf("resolving a caret into a replaced value gave %v, want ErrStaleNode", err)
 	}
 }

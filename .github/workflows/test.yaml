@@ -17,6 +17,10 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
       - name: Build
         run: go build -o /dev/null ./...
 
@@ -27,6 +31,9 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13.2
+
+      - name: Caret helper dependencies
+        run: cd testdata/node && npm ci
 
       - name: Test
         run: go test -race ./...

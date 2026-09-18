@@ -301,23 +301,34 @@ for _, c := range cursors {
 
 `Cursors` reads every participant but the local client, ordered by
 client ID, and leaves out the ones with no selection — a `null`
-cursor field is a participant who is present and not in a text. A
+selection field is a participant who is present and not in a text. A
 state whose envelope is there but cannot be read is an error rather
 than a silent absence: it means the editor and the reader disagree
 about the envelope, which is worth seeing.
 
 The envelope is the application's choice, so it is the reader's to be
 told. `WithCursorField` and `WithCursorDataField` name the two state
-fields; they default to `DefaultCursorField` (`cursor`) and
-`DefaultCursorDataField` (`data`), the names `@slate-yjs/core` uses.
-`Cursor.Data` is whatever the editor publishes beside the caret — a
-display name, a colour — left as JSON because its shape is the
-editor's too. The pair inside the envelope is `anchor` and `focus`,
-which is `goyjs.Range`'s spelling; an editor that wraps its positions
-some other way is decoded by unmarshalling the state into your own
-type and letting `goyjs.Position` decode each end. The library stops
-at the position, and this package is only the common envelope around
-it.
+fields; they default to `DefaultCursorField` (`selection`) and
+`DefaultCursorDataField` (`data`), which are `withCursors`'
+`cursorStateField` and `cursorDataField` defaults in `@slate-yjs/core`.
+A reader told the wrong name does not fail — a state without the field
+is a participant with no selection — so the defaults are held to the
+library itself: `cursor_slate_test.go` drives a real `@slate-yjs/core`
+editor, at the release pinned in `testdata/node/package-lock.json`,
+and reads what it publishes with the default reader. `Cursor.Data` is
+whatever the editor publishes beside the caret — a display name, a
+colour — left as JSON because its shape is the editor's too. The pair
+inside the envelope is `anchor` and `focus`, which is `goyjs.Range`'s
+spelling; an editor that wraps its positions some other way is decoded
+by unmarshalling the state into your own type and letting
+`goyjs.Position` decode each end. The library stops at the position,
+and this package is only the common envelope around it.
+
+One detail of the library worth knowing when reading its carets: a
+caret at the end of a text run is anchored `AssocBefore`, to the last
+unit of the run rather than to what follows, so it resolves to the end
+of the run and stays there while a peer appends after it. Everywhere
+else the caret is `AssocAfter`, yjs's default.
 
 `Editing` is the question asked per block: does this end of the caret
 point into the value that application holds for that field here, or
@@ -720,11 +731,20 @@ decides when a chunk is written are the service's own.
 ## Development
 
 ```sh
-make build   # go build -o /dev/null ./...
+make build       # go build -o /dev/null ./...
 make vet
-make lint    # golangci-lint run
+make lint        # golangci-lint run
+make node-deps   # installs the @slate-yjs/core caret helper under testdata/node
 make test
 ```
+
+`cursor_slate_test.go` needs `node` (20 or later) and the helper's
+dependencies, installed at the versions in the committed
+`testdata/node/package-lock.json` — `@slate-yjs/core`, `slate`, `yjs`
+and `y-protocols`. Moving them is a deliberate change to what the
+reader is held to, not an install-time resolution. Without them those
+tests skip with a hint and everything else runs; build, vet and lint
+never touch node.
 
 `goyjs` and `elephant-api` are pointed at working copies with
 `replace` directives while their contracts are in flight. Both go

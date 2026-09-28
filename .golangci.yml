@@ -57,11 +57,6 @@ linters:
       keywords:
         - FIXME
         - BUG
-    gomoddirectives:
-      # goyjs and elephant-api are pointed at working copies while
-      # their contracts are still in flight; the replaces go before
-      # the first tag.
-      replace-local: true
     nestif:
       min-complexity: 6
   exclusions:

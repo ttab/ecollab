@@ -757,7 +757,3 @@ and `y-protocols`. Moving them is a deliberate change to what the
 reader is held to, not an install-time resolution. Without them those
 tests skip with a hint and everything else runs; build, vet and lint
 never touch node.
-
-`goyjs` and `elephant-api` are pointed at working copies with
-`replace` directives while their contracts are in flight. Both go
-before the first tag.

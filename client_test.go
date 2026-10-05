@@ -708,7 +708,7 @@ func seedUpdate(t *testing.T) []byte {
 		Uuid:  testDoc,
 		Type:  "core/article",
 		Title: "Seeded",
-	}, ecollab.RootName)
+	}, ecollab.RootName, testLineage)
 	if err != nil {
 		t.Fatalf("BuildSeedUpdate: %v", err)
 	}

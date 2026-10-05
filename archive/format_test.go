@@ -34,6 +34,15 @@ func chunk() []archive.Record {
 			Encoding:     ecollab.EncodingStateless,
 			Data:         []byte(`{"event":"publish_in_progress","data":{}}`),
 		},
+		{
+			// Offline edits from a client's sync step 2: the same v1
+			// bytes under their own tag, with no wire change.
+			RedisID:      "1700000000003-0",
+			TSMillis:     1700000000003,
+			Subscription: "sub-a",
+			Encoding:     ecollab.EncodingV1Resync,
+			Data:         []byte{0x01, 0x04},
+		},
 	}
 }
 

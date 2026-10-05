@@ -22,7 +22,9 @@ type CloseError struct {
 	Reason string
 
 	// Message is the server's detail, where it had one to give. It is
-	// for a log line or a person, never for a branch.
+	// for a log line or a person, never for a branch. The one
+	// structured message is CloseReasonLineageMismatch's, a JSON
+	// LineageMismatch, which LineageMismatchError carries decoded.
 	Message string
 }
 
@@ -34,6 +36,142 @@ func (e *CloseError) Error() string {
 
 	return fmt.Sprintf("the subscription for %q was closed: %s: %s",
 		e.Doc, e.Reason, e.Message)
+}
+
+// LineageMismatchError is the server refusing a subscribe because
+// the client's copy of the document belongs to a different CRDT
+// lineage than the session: the lineage it declared, or the history
+// its state vector implies, is gone. It is a CloseError with
+// CloseReasonLineageMismatch, unwrapped into the parts a caller acts
+// on, and errors.As finds the *CloseError underneath it, so Reason
+// reports lineage_mismatch.
+//
+// Nothing was merged: the server sent no catch-up and accepted
+// nothing from the client. The local document is as it was, and
+// stays readable — the caller's own document when it subscribed
+// with WithDoc, and Subscription.Read after Done when the refusal
+// came on a Resync. Keep it, recover what is worth keeping (into a
+// sketch, say), and subscribe again with an empty document and no
+// lineage. Subscribing again with the same document is refused the
+// same way.
+type LineageMismatchError struct {
+	// Doc is the document whose subscribe was refused.
+	Doc string
+
+	// Declared is the lineage the subscribe declared, or "" when it
+	// declared none and the server judged the state vector instead.
+	Declared string
+
+	// Current is the session's lineage, as the server reported it.
+	// Empty when there was no session to join: the subscribe would
+	// have seeded a new lineage, which the local copy cannot belong
+	// to, and the next subscribe from an empty document seeds afresh
+	// and is told that lineage in its Synced.
+	Current string
+
+	// Reason is why the lineage the local copy belongs to ended, for
+	// telling the person what happened. LineageEndReasonUnknown when
+	// the server could not say.
+	Reason LineageEndReason
+
+	// Version is the repository version the local copy's lineage
+	// ended at, the baseline to compare the copy against; zero when
+	// there is none. See LineageMismatch.
+	Version int64
+
+	close *CloseError
+}
+
+func (e *LineageMismatchError) Error() string {
+	msg := e.describe()
+
+	if e.Reason == "" || e.Reason == LineageEndReasonUnknown {
+		return msg
+	}
+
+	return fmt.Sprintf("%s (the local lineage ended: %s)", msg, e.Reason)
+}
+
+func (e *LineageMismatchError) describe() string {
+	switch {
+	case e.Current == "" && e.Declared == "":
+		return fmt.Sprintf(
+			"the local copy of %q belongs to a lineage, and there is no session to join",
+			e.Doc)
+	case e.Current == "":
+		return fmt.Sprintf(
+			"the local copy of %q belongs to lineage %q, and there is no session to join",
+			e.Doc, e.Declared)
+	case e.Declared == "":
+		return fmt.Sprintf(
+			"the local copy of %q belongs to another lineage than the session's %q",
+			e.Doc, e.Current)
+	}
+
+	return fmt.Sprintf(
+		"the local copy of %q belongs to lineage %q, the session to %q",
+		e.Doc, e.Declared, e.Current)
+}
+
+// Unwrap returns the *CloseError the server sent.
+func (e *LineageMismatchError) Unwrap() error {
+	return e.close
+}
+
+// closeError is the error a server Close ends a subscription with:
+// a *LineageMismatchError for lineage_mismatch, which carries the
+// lineage the subscribe declared, and a plain *CloseError for
+// everything else.
+func closeError(doc, reason, message, declared string) error {
+	closed := &CloseError{Doc: doc, Reason: reason, Message: message}
+
+	if reason != CloseReasonLineageMismatch {
+		return closed
+	}
+
+	mismatch, err := DecodeLineageMismatch(message)
+	if err != nil {
+		// Not the JSON the server sends; keep what there is rather
+		// than lose the refusal over its detail.
+		mismatch = LineageMismatch{Reason: LineageEndReasonUnknown}
+	}
+
+	return &LineageMismatchError{
+		Doc:      doc,
+		Declared: declared,
+		Current:  mismatch.Lineage,
+		Reason:   mismatch.Reason,
+		Version:  mismatch.Version,
+		close:    closed,
+	}
+}
+
+// ResyncTooLargeError ends a subscription whose answer to the
+// server's sync step 1 — everything the local document holds that
+// the session lacks — is larger than MaxSyncStep2Bytes. The server
+// would refuse the frame by ending the whole connection, and refuse
+// it again after every reconnect, so the client does not send it: it
+// gives up the subscription instead and leaves the local document
+// as it was.
+//
+// It is the recovery path, as for a lineage mismatch: the local
+// edits cannot reach the session as they are. Recover what is worth
+// keeping from the document and subscribe again without it.
+type ResyncTooLargeError struct {
+	// Doc is the document whose subscription was given up.
+	Doc string
+
+	// Size is the encoded size of the step 2 that was not sent.
+	Size int
+
+	// Limit is MaxSyncStep2Bytes.
+	Limit int
+}
+
+func (e *ResyncTooLargeError) Error() string {
+	return fmt.Sprintf(
+		"the local changes to %q are %d bytes, over the %d byte sync step 2 limit",
+		e.Doc, e.Size, e.Limit)
 }
 
 // StreamError is how the stream ended when it did not end cleanly:

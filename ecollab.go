@@ -9,6 +9,10 @@
 // either is a change to both, and they are round-trip tested
 // together.
 //
+// The seed also carries its lineage, in a root of its own beside the
+// document root, where Materialize never looks and Lineage reads it
+// back.
+//
 // The rules the two implement are written down in the README, under
 // "The tree contract". The service's design document points at it
 // rather than restating it.

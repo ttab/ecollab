@@ -36,7 +36,7 @@ tree mirrors a `newsdoc.Document`. This package owns that
 correspondence in both directions:
 
 ```go
-update, err := ecollab.BuildSeedUpdate(doc, ecollab.RootName)
+update, err := ecollab.BuildSeedUpdate(doc, ecollab.RootName, lineage)
 // ... apply update, and every update the session produces after it ...
 doc, err := ecollab.Materialize(yDoc, ecollab.RootName)
 ```
@@ -48,7 +48,9 @@ a change to both, and they are round-trip tested together.
 
 The root YMap is named by `RootName` (`"document"`), and
 `CollabKey` (`"_collab"`) names the application-private key the
-translation skips.
+translation skips. The seed also writes a second root, the lineage,
+which is not part of the NewsDoc; see
+["The lineage root"](#the-lineage-root).
 
 ### Yjs structural conventions for NewsDoc
 
@@ -151,6 +153,58 @@ Two consequences worth being explicit about:
   article-editor plugin store in `_collab` during this session" can
   be answered by replaying the archive — though no normal use case
   needs this.
+
+### The lineage root
+
+A seed is a new CRDT lineage. `BuildSeedUpdate` writes into a fresh
+Y.Doc with a client ID of its own, so two seeds built from the same
+NewsDoc carry different item IDs, and an update made against one
+cannot be merged into the other without duplicating the document's
+structure. Nothing in a Yjs update identifies the lineage it belongs
+to, so the lineage is written into the document as content.
+
+`BuildSeedUpdate` takes the lineage, a ULID its caller mints, and
+writes it as a string under `LineageKey` (`"id"`) in a root YMap
+named `LineageRootName` (`"lineage"`). That root sits beside
+`document`, not inside it: `Materialize` walks only the root it is
+given, so the lineage never reaches a NewsDoc, and a test holds it to
+that.
+
+The lineage changes only when the service seeds a fresh session.
+A join replays the session's existing log, and a resume carries the
+previous session's state forward, lineage root included, so neither
+changes it. A client that keeps a document across a disconnect keeps
+its lineage with it, which is what lets the service tell a returning
+client of the same history from one whose history is gone.
+
+**The lineage a client persists and declares comes from the server,
+not from the document.** The service records each session's lineage
+itself, reports it in the `Synced` message that ends every
+subscribe, and checks a client's declared lineage against its own
+record. A client stores that value beside its local copy and
+declares it on its next subscribe. The value in the lineage root is
+document content: any writer to the document can overwrite it with
+an ordinary update, and nothing in the update says it did — a set on
+an existing map key names its neighbour rather than its parent, so
+the write cannot be picked out without the document it applies to.
+A client that took its lineage from the document would declare
+whatever the last writer put there, and every client that did so
+would be refused with `lineage_mismatch` on its next resume.
+
+The root is there for a program holding a Y.Doc and no `Synced`
+message — reading an archived or exported session, say — to learn
+which history the document was seeded as:
+
+```go
+lineage, ok := ecollab.Lineage(yDoc)
+```
+
+```js
+const seededAs = doc.getMap("lineage").get("id")
+```
+
+Treat what it returns as a description, not as an identity to
+declare.
 
 ## Editing what a person is editing
 
@@ -548,6 +602,7 @@ the same vocabulary the live pipeline used:
 | --- | --- |
 | `v1`, `v2` | Yjs document updates. Apply in stream order. |
 | `v1-seed`, `v2-seed` | Yjs updates the emitter called structural seeding rather than authorship. Apply them exactly as `v1` and `v2` — the tag is for attribution, not for filtering. |
+| `v1-resync` | A Yjs v1 update that arrived in a client's sync step 2 while its subscription was opening: edits the client made while it was away. Byte-identical to `v1`, applied and attributed like it. The service stamps it from where the update arrived; a client never claims it. |
 | `aw` | An awareness update. Not document state; never apply it to a Y.Doc. |
 | `evict` | The session ended. A live subscriber sees it as a `Close` with reason `session_terminated`. |
 | `stateless` | A server-issued lifecycle event, `{"event": ..., "data": ...}`. |
@@ -575,7 +630,38 @@ the WebSocket transport. The reason, not the code, is what says what
 to do about it: `no_active_session` means read the repository
 version instead, `session_terminated` means subscribe again for a
 fresh session, `token_expired` means re-authorize, `rate_limited`
-means coalesce rather than reconnect.
+means coalesce rather than reconnect, and `lineage_mismatch` means the
+client's copy belongs to a history the session no longer has — keep
+it, recover what is worth keeping, and subscribe again from empty.
+`lineage_mismatch`'s message is structured, in the shape of
+`session_terminated`'s `{reason, version}`: a JSON object,
+`ecollab.LineageMismatch`, holding the session's current `lineage` —
+empty when no session was open and the subscribe would have seeded a
+lineage the copy cannot belong to — the `reason` the copy's own
+lineage ended with, and the repository `version` it ended at, so a
+client can tell the person why their offline edits no longer apply and
+compare the copy against the version it was last in step with:
+
+```json
+{"lineage": "01K6H9Z3QJ8M5V2X4N7P0R1S2T", "reason": "frozen", "version": 12}
+```
+
+| Reason | The copy's lineage ended because | The work |
+| --- | --- | --- |
+| `frozen` | the document was frozen, which a publish does; `version` is the frozen one | can go back in after the document is unfrozen, once compared against `version` |
+| `reset` | someone deliberately reset the document's collaborative state | was set aside on purpose; offer it, don't restore it |
+| `purged` | a session of the lineage was purged, normally on a legal request | holds content meant to go; keep it apart |
+| `discarded` | the sketch was deleted with `DiscardSketch` | has no document to go back into; a new sketch is its only home |
+| `promoted` | the sketch became a repository document; `version` is the one the promotion created | can be compared against that version and re-applied to the document |
+| `expired` | nobody came back within the 24 hour resume window; the document itself did not change | can go back in, compared against `version` |
+| `anchor_moved` | the document was written outside collaboration after the eviction, or deleted and recreated | predates the repository's current version; compare before re-applying |
+| `unknown` | the server has no record of it; also the value for any reason a client does not know | is the client's to judge |
+
+`version` is zero when the lineage knew no repository version, as a
+sketch's does not.
+
+`EncodeLineageMismatch` and `DecodeLineageMismatch` are the codec,
+and the client hands the result over decoded.
 
 The constants are untyped, so they compare directly against the
 wire's plain string.
@@ -619,11 +705,95 @@ doc, err := sub.NewsDoc() // Materialize, on demand
 `Subscribe` returns once the server has finished initial state
 transfer, so the document is readable with no further waiting: the
 Step 2 diff against the state vector the subscribe carried has been
-applied, and the granted `Mode` is known. `Update` mutates the local
+applied, and the granted `Mode` and the session's `Lineage` are
+known. The transfer runs both ways — see
+["Working offline"](#working-offline). `Update` mutates the local
 document and forwards what the mutation produced; `Seed` is the same
 thing tagged as structural seeding rather than authorship. `Read`
 and `NewsDoc` are how the document is read — the stream's writer is
 holding the same lock, so the Y.Doc itself never escapes.
+
+### Working offline
+
+A client that keeps a document across a disconnect — an agent that
+works through a network blip, or one that is only connected some of
+the time — persists two things: the document's state, and the
+lineage `Subscription.Lineage` reported for it. Coming back, it
+restores the state into a Y.Doc and subscribes with both:
+
+```go
+doc := goyjs.New()
+err := doc.ApplyUpdateV2(saved.State)
+// ...
+sub, err := c.Subscribe(ctx, docID,
+	ecollab.WithDoc(doc), ecollab.WithLineage(saved.Lineage))
+```
+
+The handshake delivers both backlogs. The server sends a Step 2 with
+what changed while the client was away, then a Step 1 with its own
+state vector; the client answers that with a Step 2 carrying what the
+session lacks — the offline edits — and `Synced` ends it. The server
+sends `Synced` without waiting for the client's Step 2, so when the
+client did send one, `Subscribe` runs the handshake a second time
+before it returns: the server handles a connection's messages in
+order, and the second Step 1 shows whether the edits were taken.
+
+So the server's backlog is in the document when `Subscribe` returns,
+and the client's usually is in the session — but not always, and
+**`WaitDelivered` is what says so.** It returns nil once nothing is
+owed, waits while a publish soft-stop holds the edits back, and
+returns `ErrResyncDropped` if the server dropped them without a
+refusal. A client that means to discard its persisted copy, or to
+`Close`, after resuming waits on it first; until then, keep the copy.
+
+An answer with nothing the session lacks is not sent. That is not
+the same as an empty diff: a Yjs diff carries the sender's whole
+delete set whatever state vector it is computed to, so the client
+sends one only when it has items the server lacks, or deletions
+beyond those the server's Step 2 showed it already holds. A
+read-only subscription is sent no Step 1 and answers nothing.
+`ExampleClient_Subscribe_resume` is the whole shape.
+
+The lineage persisted is always the one `Synced` reported, never the
+value in the document's lineage root; see
+["The lineage root"](#the-lineage-root) for why. `Resync` declares
+the subscription's current lineage unless told otherwise.
+
+Three things can stop the edits from going through:
+
+- **A publish soft-stop.** The server refuses an update while a
+  publish is in progress, the client's Step 2 included. A Step 1 that
+  arrives during a soft-stop is not answered, a `publish_in_progress`
+  that arrives between a Step 2 and the Step 1 confirming it is taken
+  as its refusal, and either way the subscription re-handshakes on
+  `publish_cleared` and sends the Step 2 then. `Subscribe` has
+  returned by that point, and `WaitDelivered` is what returns when
+  the Step 2 has gone through. The local document is left as it is
+  meanwhile. If the refused Step 2 had in fact landed, the
+  re-handshake finds nothing to send. A confirmed Step 2 is done
+  with: later publishes do not send it again.
+- **A lineage mismatch.** The session the copy belonged to is gone
+  and the document was seeded afresh, so the copy's items cannot be
+  merged without duplicating its structure. The server refuses the
+  subscribe before it sends anything, and the client returns a
+  `*LineageMismatchError` carrying the lineage it declared and the
+  session's current one (empty when no session was open: the copy is
+  refused for the lineage the subscribe would have seeded). The copy
+  is untouched — the caller's own
+  document, or `Read` after `Done` when the refusal came on a
+  `Resync` — so recover what is worth keeping from it, into a sketch
+  for a person to copy across, and subscribe again from an empty
+  document.
+- **Too much to send.** A Step 2 is capped at `MaxSyncStep2Bytes`
+  (1 MiB), and the server refuses a larger one by ending the whole
+  connection, again after every reconnect. The client does not send
+  it: it gives up the subscription with a `*ResyncTooLargeError` and
+  leaves the copy alone — the server's catch-up is held back from it
+  until the client has answered, so it is not merged either.
+  Recovery is the same as for a mismatch. Subscribing again straight
+  away is safe: the client has already told the server to close the
+  subscription it gave up, and the new `Subscribe` waits until the
+  server has finished answering the old one.
 
 ### It needs HTTP/2, and that is easy to get wrong
 
@@ -668,7 +838,9 @@ Two shapes, and `ecollab.Reason` reads both:
 - `*CloseError` is the server closing **one** subscription, leaving
   the stream and its other documents alone. It is what a refused
   `Subscribe` returns, and what `Subscription.Err` holds after the
-  session was frozen or evicted.
+  session was frozen or evicted. A `lineage_mismatch` close arrives
+  as a `*LineageMismatchError`, which carries both lineages and the
+  reason and version, and unwraps to the `*CloseError`.
 - `*StreamError` is how the stream itself ended: a connection-wide
   refusal is the stream's status rather than a message on it,
   because a Connect stream has one. `Code` is shared between
@@ -711,6 +883,14 @@ and decodes every frame type in both directions — sync step 1 and 2,
 updates and seed-tagged updates, awareness, the `Synced` handshake,
 `Close`, stateless events, the server ping, the auth refresh and the
 subscribe options — so the protocol is what round-trips through it.
+
+The offline shape rides in the same frames. The server sends a sync
+step 1 after its step 2, and the client answers it with a step 2 of
+its own, as the stream does. The `Synced` frame's payload is the mode,
+the session's lineage and the server's state vector
+(`SyncedPayload`; `DecodeSynced` still reads the mode alone, and a
+frame from an older server ends after it), and the subscribe-options
+frame carries the lineage a client declares under the `lineage` key.
 
 Server-side clients do not need it: the `Collaborate` bidirectional
 stream carries the same messages as protobuf. The envelope is the

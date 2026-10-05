@@ -235,6 +235,10 @@ type Client struct {
 	closeOnce sync.Once
 	closeErr  error
 
+	// bg is the context the client's own work runs under — the
+	// answers the read loop sends on a subscription's behalf, the
+	// re-handshake after a publish clears — cancelled by teardown.
+	bg             context.Context
 	stopBackground context.CancelFunc
 }
 
@@ -378,6 +382,7 @@ func newClient(
 		onMessage:      cfg.onMessage,
 		subs:           make(map[string]*Subscription),
 		done:           make(chan struct{}),
+		bg:             bg,
 		stopBackground: cancel,
 	}
 
@@ -573,27 +578,41 @@ func (c *Client) dispatch(msg *collabv1.CollaborateResponse) {
 		return
 	}
 
+	if s.abandoned.Load() {
+		s.abandonedMessage(msg)
+
+		return
+	}
+
 	switch p := msg.GetPayload().(type) {
 	case *collabv1.CollaborateResponse_SyncStep2:
-		s.apply(p.SyncStep2.GetDiff())
+		s.holdStep2(p.SyncStep2.GetDiff())
 	case *collabv1.CollaborateResponse_Update:
+		s.flushStep2()
 		s.apply(p.Update.GetUpdate())
 		s.deliverUpdate(p.Update.GetUpdate(), p.Update.GetSeed())
+	case *collabv1.CollaborateResponse_SyncStep1:
+		s.answerStep1(p.SyncStep1.GetStateVector())
 	case *collabv1.CollaborateResponse_Synced:
-		s.setSynced(modeOf(p.Synced.GetMode()))
-	case *collabv1.CollaborateResponse_Close:
-		c.drop(s)
-		s.finish(&CloseError{
-			Doc:     msg.GetDoc(),
-			Reason:  p.Close.GetReason(),
-			Message: p.Close.GetMessage(),
+		s.setSynced(syncedState{
+			mode:     modeOf(p.Synced.GetMode()),
+			lineage:  p.Synced.GetLineage(),
+			serverSV: p.Synced.GetStateVector(),
 		})
+	case *collabv1.CollaborateResponse_Close:
+		s.release()
+		s.finish(closeError(
+			msg.GetDoc(), p.Close.GetReason(), p.Close.GetMessage(),
+			s.declaredLineage()))
 	case *collabv1.CollaborateResponse_Event:
-		s.deliverEvent(Event{
+		ev := Event{
 			Doc:  msg.GetDoc(),
 			Name: p.Event.GetName(),
 			Data: p.Event.GetData(),
-		})
+		}
+
+		s.observeEvent(ev.Name)
+		s.deliverEvent(ev)
 	case *collabv1.CollaborateResponse_Awareness:
 		s.deliverAwareness(p.Awareness.GetUpdate())
 	}
@@ -651,19 +670,37 @@ func (c *Client) subscriptions() []*Subscription {
 }
 
 // claim registers a subscription for docID, or reports that one is
-// already open.
-func (c *Client) claim(s *Subscription) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// already open. A subscription the client gave up itself is waited
+// out rather than counted as open: it is only still registered
+// because the server has not finished answering it.
+func (c *Client) claim(ctx context.Context, s *Subscription) error {
+	for {
+		c.mu.Lock()
 
-	if _, ok := c.subs[s.docID]; ok {
-		return ErrSubscribed
+		old, ok := c.subs[s.docID]
+		if !ok {
+			c.subs[s.docID] = s
+			c.opened = append(c.opened, s)
+			c.mu.Unlock()
+
+			return nil
+		}
+
+		c.mu.Unlock()
+
+		if !old.abandoned.Load() {
+			return ErrSubscribed
+		}
+
+		select {
+		case <-old.released:
+		case <-c.done:
+			return c.ended()
+		case <-ctx.Done():
+			return fmt.Errorf("wait for the given-up subscription to settle: %w",
+				ctx.Err())
+		}
 	}
-
-	c.subs[s.docID] = s
-	c.opened = append(c.opened, s)
-
-	return nil
 }
 
 // drop unregisters a subscription, so nothing the stream delivers for

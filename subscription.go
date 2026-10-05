@@ -69,6 +69,25 @@ const (
 	// subscribe opens a new session from the repository version.
 	CloseReasonSessionTerminated = "session_terminated"
 
+	// CloseReasonLineageMismatch: the client's copy of the document
+	// belongs to a different CRDT lineage than the session — the
+	// lineage it declared on subscribe, or the seed client ID its
+	// state vector implies, is not the session's. Its updates cannot
+	// be merged without duplicating the document's structure, so the
+	// server sends no catch-up and accepts nothing from it. This
+	// happens to a client returning after its session ended and the
+	// document was seeded afresh — or is about to be: with no session
+	// open the copy is refused the same way, since the subscribe
+	// would seed a lineage it cannot belong to. The message is a
+	// JSON object, LineageMismatch, carrying the session's current
+	// lineage (empty when there was no session), why the client's
+	// lineage ended and the repository version it ended at, so the
+	// client can tell the person what happened. Resubscribing with the same local state is refused
+	// the same way: keep the orphaned copy, recover what is worth
+	// keeping from it (into a sketch, say), and subscribe again with
+	// an empty document.
+	CloseReasonLineageMismatch = "lineage_mismatch"
+
 	// CloseReasonSubscriptionLimit: the connection already holds as
 	// many subscriptions as it may. Connection-wide: the whole
 	// connection ends, not just the subscription that asked.

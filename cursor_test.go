@@ -18,7 +18,7 @@ func hydratedDoc(t *testing.T) *goyjs.Doc {
 	doc := goyjs.New()
 	t.Cleanup(doc.Close)
 
-	seed, err := ecollab.BuildSeedUpdate(article(), ecollab.RootName)
+	seed, err := ecollab.BuildSeedUpdate(article(), ecollab.RootName, testLineage)
 	if err != nil {
 		t.Fatalf("build the seed update: %v", err)
 	}

@@ -505,7 +505,8 @@ func TestClientLineageMismatch(t *testing.T) {
 					Reason: ecollab.CloseReasonLineageMismatch,
 					Message: ecollab.EncodeLineageMismatch(ecollab.LineageMismatch{
 						Lineage: sessionLineage,
-						Cause:   ecollab.LineageEndCauseFrozen,
+						Reason:  ecollab.LineageEndReasonFrozen,
+						Version: 12,
 					}),
 				},
 			},
@@ -532,9 +533,13 @@ func TestClientLineageMismatch(t *testing.T) {
 			mismatch.Declared, mismatch.Current, staleLineage, sessionLineage)
 	}
 
-	if mismatch.Cause != ecollab.LineageEndCauseFrozen {
-		t.Errorf("mismatch cause = %q, want %q",
-			mismatch.Cause, ecollab.LineageEndCauseFrozen)
+	if mismatch.Reason != ecollab.LineageEndReasonFrozen {
+		t.Errorf("mismatch reason = %q, want %q",
+			mismatch.Reason, ecollab.LineageEndReasonFrozen)
+	}
+
+	if mismatch.Version != 12 {
+		t.Errorf("mismatch version = %d, want 12", mismatch.Version)
 	}
 
 	if got := ecollab.Reason(err); got != ecollab.CloseReasonLineageMismatch {
@@ -597,9 +602,9 @@ func TestClientLineageMismatchOnResync(t *testing.T) {
 			err, sessionLineage)
 	}
 
-	if mismatch.Cause != ecollab.LineageEndCauseUnknown {
-		t.Errorf("mismatch cause = %q, want %q for a message without one",
-			mismatch.Cause, ecollab.LineageEndCauseUnknown)
+	if mismatch.Reason != ecollab.LineageEndReasonUnknown {
+		t.Errorf("mismatch reason = %q, want %q for a message without one",
+			mismatch.Reason, ecollab.LineageEndReasonUnknown)
 	}
 
 	<-sub.Done()

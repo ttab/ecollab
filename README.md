@@ -633,27 +633,32 @@ fresh session, `token_expired` means re-authorize, `rate_limited`
 means coalesce rather than reconnect, and `lineage_mismatch` means the
 client's copy belongs to a history the session no longer has — keep
 it, recover what is worth keeping, and subscribe again from empty.
-`lineage_mismatch` is the one reason whose message is structured: a
-JSON object, `ecollab.LineageMismatch`, holding the session's current
-`lineage` — empty when no session was open and the subscribe would
-have seeded a lineage the copy cannot belong to — and the `cause` the
-copy's own lineage ended with, so a client can tell the person why
-their offline edits no longer apply:
+`lineage_mismatch`'s message is structured, in the shape of
+`session_terminated`'s `{reason, version}`: a JSON object,
+`ecollab.LineageMismatch`, holding the session's current `lineage` —
+empty when no session was open and the subscribe would have seeded a
+lineage the copy cannot belong to — the `reason` the copy's own
+lineage ended with, and the repository `version` it ended at, so a
+client can tell the person why their offline edits no longer apply and
+compare the copy against the version it was last in step with:
 
 ```json
-{"lineage": "01K6H9Z3QJ8M5V2X4N7P0R1S2T", "cause": "frozen"}
+{"lineage": "01K6H9Z3QJ8M5V2X4N7P0R1S2T", "reason": "frozen", "version": 12}
 ```
 
-| Cause | The copy's lineage ended because |
-| --- | --- |
-| `frozen` | the document was frozen, which a publish does |
-| `reset` | someone reset the document's collaborative state |
-| `purged` | a session of the lineage was purged |
-| `discarded` | the sketch was discarded |
-| `promoted` | the sketch became a repository document |
-| `expired` | nobody came back within the 24 hour resume window |
-| `anchor_moved` | the document changed outside the session after it was evicted |
-| `unknown` | the server has no record of it; also the value for any cause a client does not know |
+| Reason | The copy's lineage ended because | The work |
+| --- | --- | --- |
+| `frozen` | the document was frozen, which a publish does; `version` is the frozen one | can go back in after the document is unfrozen, once compared against `version` |
+| `reset` | someone deliberately reset the document's collaborative state | was set aside on purpose; offer it, don't restore it |
+| `purged` | a session of the lineage was purged, normally on a legal request | holds content meant to go; keep it apart |
+| `discarded` | the sketch was deleted with `DiscardSketch` | has no document to go back into; a new sketch is its only home |
+| `promoted` | the sketch became a repository document; `version` is the one the promotion created | can be compared against that version and re-applied to the document |
+| `expired` | nobody came back within the 24 hour resume window; the document itself did not change | can go back in, compared against `version` |
+| `anchor_moved` | the document was written outside collaboration after the eviction, or deleted and recreated | predates the repository's current version; compare before re-applying |
+| `unknown` | the server has no record of it; also the value for any reason a client does not know | is the client's to judge |
+
+`version` is zero when the lineage knew no repository version, as a
+sketch's does not.
 
 `EncodeLineageMismatch` and `DecodeLineageMismatch` are the codec,
 and the client hands the result over decoded.
@@ -835,7 +840,7 @@ Two shapes, and `ecollab.Reason` reads both:
   `Subscribe` returns, and what `Subscription.Err` holds after the
   session was frozen or evicted. A `lineage_mismatch` close arrives
   as a `*LineageMismatchError`, which carries both lineages and the
-  cause, and unwraps to the `*CloseError`.
+  reason and version, and unwraps to the `*CloseError`.
 - `*StreamError` is how the stream itself ended: a connection-wide
   refusal is the stream's status rather than a message on it,
   because a Connect stream has one. `Code` is shared between

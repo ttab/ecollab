@@ -5,57 +5,71 @@ import (
 	"fmt"
 )
 
-// LineageEndCause is why a lineage stopped being resumable, as a
+// LineageEndReason is why a lineage stopped being resumable, as a
 // lineage_mismatch refusal reports it for the lineage the client's
 // copy belongs to. It is what lets a client tell the person more
-// than "your copy is out of date": a copy orphaned by a publish
-// calls for a different message than one orphaned by someone
-// resetting the document.
+// than "your copy is out of date", and decide whether the work can
+// go back into the document: a copy orphaned by a publish calls for
+// a different message than one orphaned by someone resetting the
+// document.
 //
-// The set is open-ended in one direction: a client must treat a
-// value it does not know as LineageEndCauseUnknown.
-type LineageEndCause string
+// The set may grow: a client must treat a value it does not know as
+// LineageEndReasonUnknown.
+type LineageEndReason string
 
 const (
-	// LineageEndCauseFrozen: the document was frozen, which is what
-	// a publish does. The common case for a client that was offline
-	// while someone else published.
-	LineageEndCauseFrozen LineageEndCause = "frozen"
+	// LineageEndReasonFrozen: the document was frozen, which is
+	// what a publish does. The common case for a client that was
+	// offline while someone else published. Version is the frozen
+	// version; the document can be unfrozen and edited again, so the
+	// work can go back in once it has been compared against it.
+	LineageEndReasonFrozen LineageEndReason = "frozen"
 
-	// LineageEndCauseReset: someone reset the document's
-	// collaborative state, discarding what the session held.
-	LineageEndCauseReset LineageEndCause = "reset"
+	// LineageEndReasonReset: someone reset the document's
+	// collaborative state on purpose, discarding what the session
+	// held, and the repository version is what collaboration starts
+	// from again. The work was deliberately set aside; offer it,
+	// don't put it back on the person's behalf.
+	LineageEndReasonReset LineageEndReason = "reset"
 
-	// LineageEndCausePurged: a session of the lineage was purged,
-	// and its content with it.
-	LineageEndCausePurged LineageEndCause = "purged"
+	// LineageEndReasonPurged: a session of the lineage was purged —
+	// an audit-trail erasure, normally on a legal request. Keep the
+	// copy apart; it holds content that was meant to go.
+	LineageEndReasonPurged LineageEndReason = "purged"
 
-	// LineageEndCauseDiscarded: the sketch was discarded.
-	LineageEndCauseDiscarded LineageEndCause = "discarded"
+	// LineageEndReasonDiscarded: the sketch was deleted with
+	// DiscardSketch. There is no document left to put the work back
+	// into; a new sketch is the only home for it.
+	LineageEndReasonDiscarded LineageEndReason = "discarded"
 
-	// LineageEndCausePromoted: the sketch was promoted to a
+	// LineageEndReasonPromoted: the sketch was promoted to a
 	// repository document, whose sessions begin a lineage of their
-	// own.
-	LineageEndCausePromoted LineageEndCause = "promoted"
+	// own. Version is the repository version the promotion created,
+	// which holds the sketch as it was then.
+	LineageEndReasonPromoted LineageEndReason = "promoted"
 
-	// LineageEndCauseExpired: the lineage's state was kept for its
-	// resume window after the session was evicted, and the window
-	// passed before anyone came back to it.
-	LineageEndCauseExpired LineageEndCause = "expired"
+	// LineageEndReasonExpired: the lineage's state was kept for its
+	// 24 hour resume window after the session was evicted, and
+	// nobody came back within it. Nothing happened to the document;
+	// Version is the one the copy was last in step with.
+	LineageEndReasonExpired LineageEndReason = "expired"
 
-	// LineageEndCauseAnchorMoved: the document changed outside the
-	// session after it was evicted — a version written by something
-	// other than the collaboration service, or the document deleted
-	// and recreated — so the stored state no longer described it.
-	LineageEndCauseAnchorMoved LineageEndCause = "anchor_moved"
+	// LineageEndReasonAnchorMoved: the document changed outside
+	// collaboration after the session was evicted — a version
+	// written by another client of the repository, or the document
+	// deleted and recreated — so the stored state no longer
+	// described it. Version is the one the copy was last in step
+	// with; the repository has moved on from it.
+	LineageEndReasonAnchorMoved LineageEndReason = "anchor_moved"
 
-	// LineageEndCauseUnknown: the server has no record of how the
+	// LineageEndReasonUnknown: the server has no record of how the
 	// lineage ended, or of the lineage at all.
-	LineageEndCauseUnknown LineageEndCause = "unknown"
+	LineageEndReasonUnknown LineageEndReason = "unknown"
 )
 
 // LineageMismatch is the message of a CloseReasonLineageMismatch
-// close, encoded as JSON.
+// close, encoded as JSON. Its shape follows the session_terminated
+// message's {reason, version}.
 type LineageMismatch struct {
 	// Lineage is the session's current lineage, or the lineage the
 	// next subscribe would resume. Empty when there was no session
@@ -64,20 +78,28 @@ type LineageMismatch struct {
 	// told in its Synced.
 	Lineage string `json:"lineage"`
 
-	// Cause is why the lineage the client's copy belongs to ended.
-	Cause LineageEndCause `json:"cause"`
+	// Reason is why the lineage the client's copy belongs to ended.
+	Reason LineageEndReason `json:"reason"`
+
+	// Version is the repository version the client's lineage ended
+	// at: the newest version a session of the lineage wrote or
+	// started from. It is the baseline to compare the copy's content
+	// against, and the version the copy's unsaved work postdates.
+	// Zero when the lineage knew no repository version, as a sketch's
+	// does not, or when the server has no record of it.
+	Version int64 `json:"version"`
 }
 
 // EncodeLineageMismatch encodes the message of a lineage_mismatch
-// close.
+// close. An empty reason is sent as LineageEndReasonUnknown.
 func EncodeLineageMismatch(m LineageMismatch) string {
-	if m.Cause == "" {
-		m.Cause = LineageEndCauseUnknown
+	if m.Reason == "" {
+		m.Reason = LineageEndReasonUnknown
 	}
 
 	data, err := json.Marshal(m)
 	if err != nil {
-		// Two strings cannot fail to marshal.
+		// Two strings and a number cannot fail to marshal.
 		panic(fmt.Sprintf("encode lineage mismatch: %v", err))
 	}
 
@@ -85,7 +107,7 @@ func EncodeLineageMismatch(m LineageMismatch) string {
 }
 
 // DecodeLineageMismatch decodes the message of a lineage_mismatch
-// close. A missing or empty cause decodes as LineageEndCauseUnknown.
+// close. A missing or empty reason decodes as LineageEndReasonUnknown.
 func DecodeLineageMismatch(message string) (LineageMismatch, error) {
 	var m LineageMismatch
 
@@ -93,8 +115,8 @@ func DecodeLineageMismatch(message string) (LineageMismatch, error) {
 		return LineageMismatch{}, fmt.Errorf("decode lineage mismatch: %w", err)
 	}
 
-	if m.Cause == "" {
-		m.Cause = LineageEndCauseUnknown
+	if m.Reason == "" {
+		m.Reason = LineageEndReasonUnknown
 	}
 
 	return m, nil

@@ -69,10 +69,15 @@ type LineageMismatchError struct {
 	// and is told that lineage in its Synced.
 	Current string
 
-	// Cause is why the lineage the local copy belongs to ended, for
-	// telling the person what happened. LineageEndCauseUnknown when
+	// Reason is why the lineage the local copy belongs to ended, for
+	// telling the person what happened. LineageEndReasonUnknown when
 	// the server could not say.
-	Cause LineageEndCause
+	Reason LineageEndReason
+
+	// Version is the repository version the local copy's lineage
+	// ended at, the baseline to compare the copy against; zero when
+	// there is none. See LineageMismatch.
+	Version int64
 
 	close *CloseError
 }
@@ -80,11 +85,11 @@ type LineageMismatchError struct {
 func (e *LineageMismatchError) Error() string {
 	msg := e.describe()
 
-	if e.Cause == "" || e.Cause == LineageEndCauseUnknown {
+	if e.Reason == "" || e.Reason == LineageEndReasonUnknown {
 		return msg
 	}
 
-	return fmt.Sprintf("%s (the local lineage ended: %s)", msg, e.Cause)
+	return fmt.Sprintf("%s (the local lineage ended: %s)", msg, e.Reason)
 }
 
 func (e *LineageMismatchError) describe() string {
@@ -128,14 +133,15 @@ func closeError(doc, reason, message, declared string) error {
 	if err != nil {
 		// Not the JSON the server sends; keep what there is rather
 		// than lose the refusal over its detail.
-		mismatch = LineageMismatch{Cause: LineageEndCauseUnknown}
+		mismatch = LineageMismatch{Reason: LineageEndReasonUnknown}
 	}
 
 	return &LineageMismatchError{
 		Doc:      doc,
 		Declared: declared,
 		Current:  mismatch.Lineage,
-		Cause:    mismatch.Cause,
+		Reason:   mismatch.Reason,
+		Version:  mismatch.Version,
 		close:    closed,
 	}
 }

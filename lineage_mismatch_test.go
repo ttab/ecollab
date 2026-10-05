@@ -9,12 +9,13 @@ import (
 func TestLineageMismatchRoundTrip(t *testing.T) {
 	in := ecollab.LineageMismatch{
 		Lineage: "01K6H9Z3QJ8M5V2X4N7P0R1S2T",
-		Cause:   ecollab.LineageEndCauseAnchorMoved,
+		Reason:  ecollab.LineageEndReasonAnchorMoved,
+		Version: 7,
 	}
 
 	msg := ecollab.EncodeLineageMismatch(in)
 
-	if want := `{"lineage":"01K6H9Z3QJ8M5V2X4N7P0R1S2T","cause":"anchor_moved"}`; msg != want {
+	if want := `{"lineage":"01K6H9Z3QJ8M5V2X4N7P0R1S2T","reason":"anchor_moved","version":7}`; msg != want {
 		t.Errorf("encoded = %s, want %s", msg, want)
 	}
 
@@ -29,7 +30,9 @@ func TestLineageMismatchRoundTrip(t *testing.T) {
 }
 
 func TestLineageMismatchDefaultsToUnknown(t *testing.T) {
-	if got := ecollab.EncodeLineageMismatch(ecollab.LineageMismatch{}); got != `{"lineage":"","cause":"unknown"}` {
+	const want = `{"lineage":"","reason":"unknown","version":0}`
+
+	if got := ecollab.EncodeLineageMismatch(ecollab.LineageMismatch{}); got != want {
 		t.Errorf("encoded zero value = %s", got)
 	}
 
@@ -38,7 +41,7 @@ func TestLineageMismatchDefaultsToUnknown(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	if out.Cause != ecollab.LineageEndCauseUnknown {
-		t.Errorf("decoded cause = %q, want unknown", out.Cause)
+	if out.Reason != ecollab.LineageEndReasonUnknown {
+		t.Errorf("decoded reason = %q, want unknown", out.Reason)
 	}
 }

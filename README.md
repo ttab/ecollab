@@ -633,10 +633,30 @@ fresh session, `token_expired` means re-authorize, `rate_limited`
 means coalesce rather than reconnect, and `lineage_mismatch` means the
 client's copy belongs to a history the session no longer has — keep
 it, recover what is worth keeping, and subscribe again from empty.
-`lineage_mismatch` is the one reason whose message is structured: it
-is the session's current lineage, bare — or empty when no session was
-open and the subscribe would have seeded a lineage the copy cannot
-belong to.
+`lineage_mismatch` is the one reason whose message is structured: a
+JSON object, `ecollab.LineageMismatch`, holding the session's current
+`lineage` — empty when no session was open and the subscribe would
+have seeded a lineage the copy cannot belong to — and the `cause` the
+copy's own lineage ended with, so a client can tell the person why
+their offline edits no longer apply:
+
+```json
+{"lineage": "01K6H9Z3QJ8M5V2X4N7P0R1S2T", "cause": "frozen"}
+```
+
+| Cause | The copy's lineage ended because |
+| --- | --- |
+| `frozen` | the document was frozen, which a publish does |
+| `reset` | someone reset the document's collaborative state |
+| `purged` | a session of the lineage was purged |
+| `discarded` | the sketch was discarded |
+| `promoted` | the sketch became a repository document |
+| `expired` | nobody came back within the 24 hour resume window |
+| `anchor_moved` | the document changed outside the session after it was evicted |
+| `unknown` | the server has no record of it; also the value for any cause a client does not know |
+
+`EncodeLineageMismatch` and `DecodeLineageMismatch` are the codec,
+and the client hands the result over decoded.
 
 The constants are untyped, so they compare directly against the
 wire's plain string.
@@ -814,8 +834,8 @@ Two shapes, and `ecollab.Reason` reads both:
   the stream and its other documents alone. It is what a refused
   `Subscribe` returns, and what `Subscription.Err` holds after the
   session was frozen or evicted. A `lineage_mismatch` close arrives
-  as a `*LineageMismatchError`, which carries both lineages and
-  unwraps to the `*CloseError`.
+  as a `*LineageMismatchError`, which carries both lineages and the
+  cause, and unwraps to the `*CloseError`.
 - `*StreamError` is how the stream itself ended: a connection-wide
   refusal is the stream's status rather than a message on it,
   because a Connect stream has one. `Code` is shared between

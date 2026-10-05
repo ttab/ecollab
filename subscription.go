@@ -78,10 +78,11 @@ const (
 	// happens to a client returning after its session ended and the
 	// document was seeded afresh — or is about to be: with no session
 	// open the copy is refused the same way, since the subscribe
-	// would seed a lineage it cannot belong to. The message is the
-	// session's current lineage, bare, so the client can tell the
-	// person what happened; it is empty when there was no session.
-	// Resubscribing with the same local state is refused
+	// would seed a lineage it cannot belong to. The message is a
+	// JSON object, LineageMismatch, carrying the session's current
+	// lineage (empty when there was no session) and why the client's
+	// lineage ended, so the client can tell the person what
+	// happened. Resubscribing with the same local state is refused
 	// the same way: keep the orphaned copy, recover what is worth
 	// keeping from it (into a sketch, say), and subscribe again with
 	// an empty document.

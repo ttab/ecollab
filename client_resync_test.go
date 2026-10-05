@@ -502,8 +502,11 @@ func TestClientLineageMismatch(t *testing.T) {
 			Doc: req.GetDoc(),
 			Payload: &collabv1.CollaborateResponse_Close{
 				Close: &collabv1.Close{
-					Reason:  ecollab.CloseReasonLineageMismatch,
-					Message: sessionLineage,
+					Reason: ecollab.CloseReasonLineageMismatch,
+					Message: ecollab.EncodeLineageMismatch(ecollab.LineageMismatch{
+						Lineage: sessionLineage,
+						Cause:   ecollab.LineageEndCauseFrozen,
+					}),
 				},
 			},
 		})
@@ -527,6 +530,11 @@ func TestClientLineageMismatch(t *testing.T) {
 	if mismatch.Declared != staleLineage || mismatch.Current != sessionLineage {
 		t.Errorf("mismatch = declared %q, current %q; want %q, %q",
 			mismatch.Declared, mismatch.Current, staleLineage, sessionLineage)
+	}
+
+	if mismatch.Cause != ecollab.LineageEndCauseFrozen {
+		t.Errorf("mismatch cause = %q, want %q",
+			mismatch.Cause, ecollab.LineageEndCauseFrozen)
 	}
 
 	if got := ecollab.Reason(err); got != ecollab.CloseReasonLineageMismatch {
@@ -571,8 +579,10 @@ func TestClientLineageMismatchOnResync(t *testing.T) {
 			Doc: req.GetDoc(),
 			Payload: &collabv1.CollaborateResponse_Close{
 				Close: &collabv1.Close{
-					Reason:  ecollab.CloseReasonLineageMismatch,
-					Message: staleLineage,
+					Reason: ecollab.CloseReasonLineageMismatch,
+					Message: ecollab.EncodeLineageMismatch(ecollab.LineageMismatch{
+						Lineage: staleLineage,
+					}),
 				},
 			},
 		})
@@ -585,6 +595,11 @@ func TestClientLineageMismatchOnResync(t *testing.T) {
 	if !errors.As(err, &mismatch) || mismatch.Declared != sessionLineage {
 		t.Fatalf("Resync error = %v, want a mismatch declaring %q",
 			err, sessionLineage)
+	}
+
+	if mismatch.Cause != ecollab.LineageEndCauseUnknown {
+		t.Errorf("mismatch cause = %q, want %q for a message without one",
+			mismatch.Cause, ecollab.LineageEndCauseUnknown)
 	}
 
 	<-sub.Done()

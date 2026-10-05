@@ -23,9 +23,8 @@ type CloseError struct {
 
 	// Message is the server's detail, where it had one to give. It is
 	// for a log line or a person, never for a branch. The one
-	// structured message is CloseReasonLineageMismatch's, which is
-	// the session's current lineage, or empty when there was no
-	// session to join.
+	// structured message is CloseReasonLineageMismatch's, a JSON
+	// LineageMismatch, which LineageMismatchError carries decoded.
 	Message string
 }
 
@@ -70,10 +69,25 @@ type LineageMismatchError struct {
 	// and is told that lineage in its Synced.
 	Current string
 
+	// Cause is why the lineage the local copy belongs to ended, for
+	// telling the person what happened. LineageEndCauseUnknown when
+	// the server could not say.
+	Cause LineageEndCause
+
 	close *CloseError
 }
 
 func (e *LineageMismatchError) Error() string {
+	msg := e.describe()
+
+	if e.Cause == "" || e.Cause == LineageEndCauseUnknown {
+		return msg
+	}
+
+	return fmt.Sprintf("%s (the local lineage ended: %s)", msg, e.Cause)
+}
+
+func (e *LineageMismatchError) describe() string {
 	switch {
 	case e.Current == "" && e.Declared == "":
 		return fmt.Sprintf(
@@ -110,10 +124,18 @@ func closeError(doc, reason, message, declared string) error {
 		return closed
 	}
 
+	mismatch, err := DecodeLineageMismatch(message)
+	if err != nil {
+		// Not the JSON the server sends; keep what there is rather
+		// than lose the refusal over its detail.
+		mismatch = LineageMismatch{Cause: LineageEndCauseUnknown}
+	}
+
 	return &LineageMismatchError{
 		Doc:      doc,
 		Declared: declared,
-		Current:  message,
+		Current:  mismatch.Lineage,
+		Cause:    mismatch.Cause,
 		close:    closed,
 	}
 }

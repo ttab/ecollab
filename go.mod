@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	connectrpc.com/connect v1.20.0
-	github.com/ttab/elephant-api v0.26.0
+	github.com/ttab/elephant-api v0.26.1-0.20261005062249-176708e8a89d
 	github.com/ttab/goyjs v0.1.1
 	google.golang.org/protobuf v1.36.12
 )

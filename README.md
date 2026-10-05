@@ -680,11 +680,95 @@ doc, err := sub.NewsDoc() // Materialize, on demand
 `Subscribe` returns once the server has finished initial state
 transfer, so the document is readable with no further waiting: the
 Step 2 diff against the state vector the subscribe carried has been
-applied, and the granted `Mode` is known. `Update` mutates the local
+applied, and the granted `Mode` and the session's `Lineage` are
+known. The transfer runs both ways — see
+["Working offline"](#working-offline). `Update` mutates the local
 document and forwards what the mutation produced; `Seed` is the same
 thing tagged as structural seeding rather than authorship. `Read`
 and `NewsDoc` are how the document is read — the stream's writer is
 holding the same lock, so the Y.Doc itself never escapes.
+
+### Working offline
+
+A client that keeps a document across a disconnect — an agent that
+works through a network blip, or one that is only connected some of
+the time — persists two things: the document's state, and the
+lineage `Subscription.Lineage` reported for it. Coming back, it
+restores the state into a Y.Doc and subscribes with both:
+
+```go
+doc := goyjs.New()
+err := doc.ApplyUpdateV2(saved.State)
+// ...
+sub, err := c.Subscribe(ctx, docID,
+	ecollab.WithDoc(doc), ecollab.WithLineage(saved.Lineage))
+```
+
+The handshake delivers both backlogs. The server sends a Step 2 with
+what changed while the client was away, then a Step 1 with its own
+state vector; the client answers that with a Step 2 carrying what the
+session lacks — the offline edits — and `Synced` ends it. The server
+sends `Synced` without waiting for the client's Step 2, so when the
+client did send one, `Subscribe` runs the handshake a second time
+before it returns: the server handles a connection's messages in
+order, and the second Step 1 shows whether the edits were taken.
+
+So the server's backlog is in the document when `Subscribe` returns,
+and the client's usually is in the session — but not always, and
+**`WaitDelivered` is what says so.** It returns nil once nothing is
+owed, waits while a publish soft-stop holds the edits back, and
+returns `ErrResyncDropped` if the server dropped them without a
+refusal. A client that means to discard its persisted copy, or to
+`Close`, after resuming waits on it first; until then, keep the copy.
+
+An answer with nothing the session lacks is not sent. That is not
+the same as an empty diff: a Yjs diff carries the sender's whole
+delete set whatever state vector it is computed to, so the client
+sends one only when it has items the server lacks, or deletions
+beyond those the server's Step 2 showed it already holds. A
+read-only subscription is sent no Step 1 and answers nothing.
+`ExampleClient_Subscribe_resume` is the whole shape.
+
+The lineage persisted is always the one `Synced` reported, never the
+value in the document's lineage root; see
+["The lineage root"](#the-lineage-root) for why. `Resync` declares
+the subscription's current lineage unless told otherwise.
+
+Three things can stop the edits from going through:
+
+- **A publish soft-stop.** The server refuses an update while a
+  publish is in progress, the client's Step 2 included. A Step 1 that
+  arrives during a soft-stop is not answered, a `publish_in_progress`
+  that arrives between a Step 2 and the Step 1 confirming it is taken
+  as its refusal, and either way the subscription re-handshakes on
+  `publish_cleared` and sends the Step 2 then. `Subscribe` has
+  returned by that point, and `WaitDelivered` is what returns when
+  the Step 2 has gone through. The local document is left as it is
+  meanwhile. If the refused Step 2 had in fact landed, the
+  re-handshake finds nothing to send. A confirmed Step 2 is done
+  with: later publishes do not send it again.
+- **A lineage mismatch.** The session the copy belonged to is gone
+  and the document was seeded afresh, so the copy's items cannot be
+  merged without duplicating its structure. The server refuses the
+  subscribe before it sends anything, and the client returns a
+  `*LineageMismatchError` carrying the lineage it declared and the
+  session's current one (empty when no session was open: the copy is
+  refused for the lineage the subscribe would have seeded). The copy
+  is untouched — the caller's own
+  document, or `Read` after `Done` when the refusal came on a
+  `Resync` — so recover what is worth keeping from it, into a sketch
+  for a person to copy across, and subscribe again from an empty
+  document.
+- **Too much to send.** A Step 2 is capped at `MaxSyncStep2Bytes`
+  (1 MiB), and the server refuses a larger one by ending the whole
+  connection, again after every reconnect. The client does not send
+  it: it gives up the subscription with a `*ResyncTooLargeError` and
+  leaves the copy alone — the server's catch-up is held back from it
+  until the client has answered, so it is not merged either.
+  Recovery is the same as for a mismatch. Subscribing again straight
+  away is safe: the client has already told the server to close the
+  subscription it gave up, and the new `Subscribe` waits until the
+  server has finished answering the old one.
 
 ### It needs HTTP/2, and that is easy to get wrong
 
@@ -729,7 +813,9 @@ Two shapes, and `ecollab.Reason` reads both:
 - `*CloseError` is the server closing **one** subscription, leaving
   the stream and its other documents alone. It is what a refused
   `Subscribe` returns, and what `Subscription.Err` holds after the
-  session was frozen or evicted.
+  session was frozen or evicted. A `lineage_mismatch` close arrives
+  as a `*LineageMismatchError`, which carries both lineages and
+  unwraps to the `*CloseError`.
 - `*StreamError` is how the stream itself ended: a connection-wide
   refusal is the stream's status rather than a message on it,
   because a Connect stream has one. `Code` is shared between

@@ -41,6 +41,13 @@ import (
 // than whether it is the caret's type, and why it takes its ranges and
 // writes its formatting in the paragraph.
 //
+// The document here arrives as one update and the agent stays
+// connected throughout. An agent that keeps working through a
+// disconnect persists its copy together with the lineage its
+// subscription reports, and hands its edits over when it subscribes
+// again; ExampleClient_Subscribe_resume shows that shape, and nothing
+// in this file changes with it.
+//
 // The analysis here is a fixed-string search. A real agent would put
 // a model behind that step and nothing else about the shape would
 // change: what it produces is a range and a thread id, and the range

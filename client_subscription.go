@@ -6,11 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	collabv1 "github.com/ttab/elephant-api/elephant/collab/v1"
 	"github.com/ttab/elephant-api/newsdoc"
 	"github.com/ttab/goyjs"
 )
+
+// MaxSyncStep2Bytes is the largest sync step 2 the service accepts
+// from a client: the answer to its sync step 1, carrying everything
+// the local document holds that the session lacks. It is larger than
+// the cap on an ordinary update because a day of offline edits
+// arrives in one, and a merged Yjs update cannot be split. A larger
+// one is not sent; see ResyncTooLargeError.
+const MaxSyncStep2Bytes = 1 << 20
 
 // SubscribeOption configures one subscription.
 type SubscribeOption func(*subscribeConfig)
@@ -19,6 +28,7 @@ type subscribeConfig struct {
 	observer    bool
 	advertise   *bool
 	freezeOn    []string
+	lineage     string
 	doc         *goyjs.Doc
 	onUpdate    func(update []byte, seed bool)
 	onAwareness func(update []byte)
@@ -62,7 +72,9 @@ func FreezeOnWorkflowStates(states ...string) SubscribeOption {
 // state carried over from an earlier session, or built from a
 // repository version — so the state vector the subscribe carries is
 // not empty and the server's Step 2 is a diff rather than the whole
-// document.
+// document. Whatever the document holds that the session does not is
+// sent back in the handshake; pair it with WithLineage for a copy
+// persisted from an earlier subscription.
 //
 // The document is the caller's: Close leaves it open, and the caller
 // must not touch it outside Read and Update while the subscription
@@ -70,6 +82,25 @@ func FreezeOnWorkflowStates(states ...string) SubscribeOption {
 func WithDoc(doc *goyjs.Doc) SubscribeOption {
 	return func(c *subscribeConfig) {
 		c.doc = doc
+	}
+}
+
+// WithLineage declares the lineage the local document belongs to:
+// the value Subscription.Lineage reported when the document was last
+// in sync, persisted alongside it. The server checks it against the
+// session's own lineage before it computes any catch-up, and refuses
+// a mismatch with a *LineageMismatchError rather than merging two
+// histories into duplicate structure.
+//
+// It belongs with WithDoc: a client resuming from a persisted copy
+// declares the lineage it persisted with that copy. Take it from
+// Subscription.Lineage, never from the document's lineage root —
+// see Lineage for why. A fresh client with an empty document
+// declares nothing; so may a client that lost the value, in which
+// case the server judges the state vector alone.
+func WithLineage(lineage string) SubscribeOption {
+	return func(c *subscribeConfig) {
+		c.lineage = lineage
 	}
 }
 
@@ -123,14 +154,81 @@ type Subscription struct {
 	doc    *goyjs.Doc
 	ownDoc bool
 
-	// synced carries the mode from every Synced the server sends —
-	// one per subscribe, including a repeat one. Buffered so the
-	// read loop never waits for a caller that has stopped listening.
-	synced chan SubscriptionMode
+	// hsMu serialises handshakes, so a Resync and the re-handshake
+	// that follows a publish_cleared cannot take each other's
+	// Synced.
+	hsMu sync.Mutex
 
-	mu   sync.Mutex
-	mode SubscriptionMode
-	err  error
+	// synced carries every Synced the server sends — one per
+	// subscribe, including a repeat one. Buffered so the read loop
+	// never waits for a caller that has stopped listening.
+	synced chan syncedState
+
+	// heldStep2 is the server's sync step 2, held back from the
+	// document until the step 1 behind it has been answered, so that
+	// a subscribe given up while answering leaves a WithDoc document
+	// as the caller passed it. Guarded by docMu.
+	heldStep2 []byte
+
+	mu       sync.Mutex
+	mode     SubscriptionMode
+	lineage  string
+	serverSV []byte
+	err      error
+
+	// declared is the lineage the latest handshake declared, kept
+	// for the error a lineage_mismatch refusal of it becomes.
+	declared string
+
+	// unsent is the deletions in the local document the session may
+	// not hold: those in a WithDoc document when it was passed in,
+	// less those the server's step 2 showed it already had. A Yjs
+	// diff carries the whole delete set whatever state vector it is
+	// computed to, so this, and not the diff, is what says whether a
+	// step 2 with no structs has anything to deliver. It is emptied
+	// by a step 2 that landed, which carried them all.
+	// unsentUnknown says the document's delete set could not be
+	// read, and any non-empty diff is sent.
+	unsent        deleteSet
+	unsentUnknown bool
+
+	// softStopped follows the publish soft-stop events: true from a
+	// publish_in_progress to the next publish_cleared.
+	softStopped bool
+
+	// inFlight is a sync step 2 that has gone out and not yet been
+	// confirmed. The step 1 of the next handshake confirms it, since
+	// the server handles a connection's messages in order: a
+	// refusal would have come first. Until then a
+	// publish_in_progress is read as its refusal.
+	inFlight *step2Flight
+
+	// resyncOwed says a sync step 2 was refused, or held back, by the
+	// soft-stop, and the subscription re-handshakes when it clears.
+	resyncOwed    bool
+	rehandshaking bool
+
+	// dropped says a step 2 went out, was not refused, and the
+	// confirming step 1 shows the session without it. The server
+	// gave no reason, so it is not retried until the next Resync.
+	dropped bool
+
+	// delivery is closed and replaced whenever inFlight,
+	// resyncOwed or dropped changes, which is what WaitDelivered
+	// waits on.
+	delivery chan struct{}
+
+	// outstanding counts the subscribes sent and not yet answered by
+	// a Synced. A subscription given up mid-handshake stays
+	// registered until it reaches zero, so the Synced still on its
+	// way cannot answer the next subscription for the document.
+	outstanding int
+
+	// abandoned says the client gave the subscription up itself;
+	// see abandon. Set under mu.
+	abandoned   atomic.Bool
+	released    chan struct{}
+	releaseOnce sync.Once
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -142,14 +240,37 @@ type Subscription struct {
 
 // Subscribe opens a subscription for docID and blocks until the
 // server has finished initial state transfer, which is what its
-// Synced message marks. The granted mode is on the returned
-// subscription.
+// Synced message marks. The granted mode and the session's lineage
+// are on the returned subscription.
+//
+// State transfer runs both ways. The server sends what the local
+// document lacks, then its own state vector; the client answers with
+// what the session lacks — the edits a document passed with WithDoc
+// gained while it was offline. So a client resuming from a persisted
+// copy subscribes with WithDoc and WithLineage and lets the handshake
+// deliver both backlogs. When the client did send something,
+// Subscribe runs the handshake a second time before it returns: the
+// server handles a connection's messages in order, so that second
+// answer is what shows the edits were taken. WaitDelivered says
+// whether they were — a publish soft-stop can hold them past the
+// return — and is what to wait on before treating a persisted copy
+// as handed over.
 //
 // A refusal is an error: a *CloseError carrying the reason when the
 // server closed this document's subscription — CloseReasonReadOnly,
-// CloseReasonNoActiveSession, CloseReasonSubscribeFailed — and the
-// stream's terminal error when the refusal took the whole connection,
-// as the subscription cap does.
+// CloseReasonNoActiveSession, CloseReasonSubscribeFailed — a
+// *LineageMismatchError when the local document belongs to a history
+// the session no longer has, a *ResyncTooLargeError when its offline
+// edits are too large to send, and the stream's terminal error when
+// the refusal took the whole connection, as the subscription cap
+// does. A document passed with WithDoc is untouched by any of them:
+// the server's catch-up is held back from it until the client has
+// answered, and a subscribe that fails before then never applies it.
+//
+// After a *ResyncTooLargeError, or any error the client raised
+// itself, a new Subscribe for the same document waits until the
+// server has finished answering the one that was given up, so the
+// two cannot be confused.
 //
 // Editors need write permission on the document, not just read: a
 // fresh session takes a repository lock with the service's own
@@ -174,7 +295,9 @@ func (c *Client) Subscribe(
 		docID:       docID,
 		doc:         cfg.doc,
 		ownDoc:      cfg.doc == nil,
-		synced:      make(chan SubscriptionMode, 4),
+		synced:      make(chan syncedState, 4),
+		delivery:    make(chan struct{}),
+		released:    make(chan struct{}),
 		done:        make(chan struct{}),
 		onUpdate:    cfg.onUpdate,
 		onAwareness: cfg.onAwareness,
@@ -183,19 +306,33 @@ func (c *Client) Subscribe(
 
 	if s.doc == nil {
 		s.doc = goyjs.New()
+	} else {
+		// A diff to the document's own state vector carries no
+		// structs, only the whole delete set.
+		ds, err := encodedDeleteSet(s.doc.EncodeDiffV1(s.doc.StateVectorV1()))
+		if err != nil {
+			s.unsentUnknown = true
+		} else {
+			s.unsent = ds
+		}
 	}
 
-	if err := c.claim(s); err != nil {
+	if err := c.claim(ctx, s); err != nil {
 		s.closeDoc()
 
 		return nil, err
 	}
 
-	mode, err := s.handshake(ctx, cfg.request(s.StateVector()))
+	mode, err := s.handshake(ctx, cfg, cfg.lineage)
 	if err != nil {
 		// A refused subscribe leaves nothing behind: no registration,
-		// and no document for Client.Close to free twice.
-		c.drop(s)
+		// and no document for Client.Close to free twice. One the
+		// client gave up itself unregisters when the server has
+		// finished answering it.
+		if !s.abandoned.Load() {
+			s.release()
+		}
+
 		s.finish(err)
 		s.closeDoc()
 
@@ -208,13 +345,16 @@ func (c *Client) Subscribe(
 }
 
 // request is the Subscribe payload the options resolve to.
-func (c subscribeConfig) request(sv []byte) *collabv1.CollaborateRequest_Subscribe {
+func (c subscribeConfig) request(
+	sv []byte, lineage string,
+) *collabv1.CollaborateRequest_Subscribe {
 	return &collabv1.CollaborateRequest_Subscribe{
 		Subscribe: &collabv1.Subscribe{
 			StateVector:            sv,
 			AdvertisePresence:      c.advertise,
 			Observer:               c.observer,
 			FreezeOnWorkflowStates: c.freezeOn,
+			Lineage:                lineage,
 		},
 	}
 }
@@ -230,6 +370,31 @@ func (s *Subscription) Mode() SubscriptionMode {
 	defer s.mu.Unlock()
 
 	return s.mode
+}
+
+// Lineage is the session's lineage, as the latest Synced reported
+// it, or "" before the first one and from a server too old to say.
+//
+// It is the value to persist alongside the local document and to
+// declare with WithLineage when subscribing from that copy again:
+// it names the CRDT history the document's items belong to, and the
+// server uses it to tell a returning client of the same history from
+// one whose history is gone.
+func (s *Subscription) Lineage() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.lineage
+}
+
+// ServerStateVector is the server's state vector as the latest
+// Synced reported it: the point the server's half of that handshake
+// was computed at. Nil before the first Synced.
+func (s *Subscription) ServerStateVector() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return bytes.Clone(s.serverSV)
 }
 
 // Done is closed when the subscription has ended. Err says how.
@@ -420,17 +585,27 @@ func (s *Subscription) QueryAwareness(ctx context.Context) error {
 	})
 }
 
-// Resync re-syncs an open subscription: the server answers the
-// current state vector with a Step 2 for anything missing and a
-// fresh Synced. It does not re-open the session, re-seed it, or
+// Resync re-runs the handshake on an open subscription: the server
+// sends its sync step 1 (to a read-write subscription), the client
+// answers it with whatever the local document holds that the
+// session lacks, and a fresh Synced ends it. The server sends no
+// step 2, because the subscription has been on the live tail and
+// already holds the session's state. When the client did send a
+// step 2, the handshake runs once more to confirm it, as
+// Subscribe's does. It does not re-open the session, re-seed it, or
 // re-apply the subscribe options — those decisions were made when
 // the subscription opened.
+//
+// The subscription does this itself after a publish soft-stop held
+// its step 2 back, so a caller rarely needs to. A Resync is also how
+// to try again after WaitDelivered reported ErrResyncDropped.
 //
 // It takes the same options as Subscribe because the message on the
 // wire carries them either way, and the server ignoring them on an
 // open subscription is the contract. Only the options that shape the
 // message are read: the callbacks and the document stay as
-// Subscribe left them.
+// Subscribe left them. The lineage declared is WithLineage's when
+// given and Lineage otherwise.
 func (s *Subscription) Resync(
 	ctx context.Context, opts ...SubscribeOption,
 ) (SubscriptionMode, error) {
@@ -440,7 +615,12 @@ func (s *Subscription) Resync(
 		opt(&cfg)
 	}
 
-	mode, err := s.handshake(ctx, cfg.request(s.StateVector()))
+	lineage := cfg.lineage
+	if lineage == "" {
+		lineage = s.Lineage()
+	}
+
+	mode, err := s.handshake(ctx, cfg, lineage)
 	if err != nil {
 		return "", err
 	}
@@ -469,26 +649,156 @@ func (s *Subscription) Unsubscribe(ctx context.Context) error {
 	})
 }
 
-// handshake sends a Subscribe and waits for the Synced that answers
-// it.
-func (s *Subscription) handshake(
-	ctx context.Context, payload *collabv1.CollaborateRequest_Subscribe,
-) (SubscriptionMode, error) {
-	// A Synced left over from an earlier subscribe would answer this
-	// one.
-	drain(s.synced)
+// ErrResyncDropped is WaitDelivered's answer when the client sent the
+// session its local changes, the server did not refuse them, and the
+// next handshake showed the session without them: the server dropped
+// them and gave no reason. They are not sent again on their own;
+// Resync tries once more.
+var ErrResyncDropped = errors.New("the session did not take the local changes")
 
-	err := s.client.send(ctx, &collabv1.CollaborateRequest{
-		Doc:     s.docID,
-		Payload: payload,
-	})
+// WaitDelivered blocks until everything the handshakes so far owed
+// the session has reached it: the edits a WithDoc document carried
+// in, and those made while a step 2 was held. It returns nil when
+// nothing is owed, which is the usual case when Subscribe returns:
+// a step 2 that went out has been confirmed by then.
+//
+// What it waits through is a publish soft-stop. The server refuses
+// a step 2 while one is in force, and the subscription holds it and
+// sends it again when the soft-stop clears, so the edits are only
+// delivered then. A client that means to discard its persisted copy,
+// or to Close, after resuming waits here first.
+//
+// It returns ErrResyncDropped when the server dropped the step 2
+// without refusing it, the subscription's error when the
+// subscription ends with something still owed, and the context's
+// error when that ends first. Updates made with Update are not
+// tracked here: they are forwarded as they are made.
+func (s *Subscription) WaitDelivered(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+
+		var (
+			dropped = s.dropped
+			owed    = s.inFlight != nil || s.resyncOwed
+			changed = s.delivery
+		)
+
+		s.mu.Unlock()
+
+		switch {
+		case dropped:
+			return ErrResyncDropped
+		case !owed:
+			return nil
+		}
+
+		select {
+		case <-changed:
+		case <-s.done:
+			if err := s.Err(); err != nil {
+				return err
+			}
+
+			return ErrClosed
+		case <-ctx.Done():
+			return fmt.Errorf("wait for the local changes to be delivered: %w",
+				ctx.Err())
+		}
+	}
+}
+
+// handshake sends a Subscribe declaring lineage and waits for the
+// Synced that answers it. The server's sync step 1, which arrives
+// before the Synced, is answered by the read loop; see answerStep1.
+//
+// When that answer sent a step 2, the handshake runs once more. The
+// server handles a connection's messages in order, so the second
+// step 1 is computed after the step 2 was taken or refused, and
+// answerStep1 reads the outcome off it. That bounds the window in
+// which a publish_in_progress is taken for a refusal to the
+// handshake itself.
+func (s *Subscription) handshake(
+	ctx context.Context, cfg subscribeConfig, lineage string,
+) (SubscriptionMode, error) {
+	s.hsMu.Lock()
+	defer s.hsMu.Unlock()
+
+	// An explicit handshake is a retry of anything dropped.
+	s.mu.Lock()
+	s.dropped = false
+	s.signalDeliveryLocked()
+	s.mu.Unlock()
+
+	mode, err := s.subscribeOnce(ctx, cfg, lineage)
 	if err != nil {
 		return "", err
 	}
 
-	select {
-	case mode := <-s.synced:
+	s.mu.Lock()
+	confirm := s.inFlight != nil
+	s.mu.Unlock()
+
+	if !confirm {
 		return mode, nil
+	}
+
+	// The first Synced has reported the session's lineage, which a
+	// fresh client did not have to declare.
+	if lineage == "" {
+		lineage = s.Lineage()
+	}
+
+	return s.subscribeOnce(ctx, cfg, lineage)
+}
+
+// subscribeOnce is one Subscribe and the Synced that answers it.
+func (s *Subscription) subscribeOnce(
+	ctx context.Context, cfg subscribeConfig, lineage string,
+) (SubscriptionMode, error) {
+	// A subscribe for a subscription that has ended would open a new
+	// one on the server that nothing here routes to.
+	select {
+	case <-s.done:
+		if err := s.Err(); err != nil {
+			return "", err
+		}
+
+		return "", ErrClosed
+	default:
+	}
+
+	// A Synced left over from an earlier subscribe would answer this
+	// one.
+	drain(s.synced)
+
+	s.mu.Lock()
+
+	if s.abandoned.Load() {
+		s.mu.Unlock()
+
+		return "", s.Err()
+	}
+
+	s.declared = lineage
+	s.outstanding++
+
+	s.mu.Unlock()
+
+	err := s.client.send(ctx, &collabv1.CollaborateRequest{
+		Doc:     s.docID,
+		Payload: cfg.request(s.StateVector(), lineage),
+	})
+	if err != nil {
+		s.mu.Lock()
+		s.outstanding--
+		s.mu.Unlock()
+
+		return "", err
+	}
+
+	select {
+	case st := <-s.synced:
+		return st.mode, nil
 	case <-s.done:
 		return "", s.Err()
 	case <-s.client.done:
@@ -499,7 +809,7 @@ func (s *Subscription) handshake(
 	}
 }
 
-func drain(ch chan SubscriptionMode) {
+func drain(ch chan syncedState) {
 	for {
 		select {
 		case <-ch:
@@ -511,8 +821,8 @@ func drain(ch chan SubscriptionMode) {
 
 // apply folds one inbound update into the local document. A document
 // that cannot take an update has diverged from the session, and the
-// subscription ends rather than carrying on with a local state
-// nobody else has.
+// subscription is given up rather than carrying on with a local
+// state nobody else has.
 func (s *Subscription) apply(update []byte) {
 	if isEmptyUpdateV1(update) {
 		return
@@ -528,19 +838,356 @@ func (s *Subscription) apply(update []byte) {
 	s.docMu.Unlock()
 
 	if err != nil {
-		s.client.drop(s)
-		s.finish(fmt.Errorf(
+		s.abandon(fmt.Errorf(
 			"apply an inbound update to the local document: %w", err))
 	}
 }
 
-func (s *Subscription) setSynced(mode SubscriptionMode) {
-	s.setMode(mode)
+// holdStep2 takes the server's sync step 2. Its delete set is the
+// server's whole one, so whatever deletions the local document
+// shares with it are not news to the session. The diff itself waits
+// in heldStep2 for flushStep2.
+func (s *Subscription) holdStep2(diff []byte) {
+	s.flushStep2()
+
+	if isEmptyUpdateV1(diff) {
+		return
+	}
+
+	if _, ds, err := updateV1DeleteSet(diff); err == nil {
+		s.mu.Lock()
+		s.unsent = s.unsent.subtract(ds)
+		s.mu.Unlock()
+	}
+
+	s.docMu.Lock()
+	s.heldStep2 = diff
+	s.docMu.Unlock()
+}
+
+// flushStep2 applies a held server step 2, if there is one.
+func (s *Subscription) flushStep2() {
+	s.docMu.Lock()
+	held := s.heldStep2
+	s.heldStep2 = nil
+	s.docMu.Unlock()
+
+	if held != nil {
+		s.apply(held)
+	}
+}
+
+// syncedState is what one Synced reports.
+type syncedState struct {
+	mode     SubscriptionMode
+	lineage  string
+	serverSV []byte
+}
+
+func (s *Subscription) setSynced(st syncedState) {
+	// A read-only subscription is sent no step 1, so this is where
+	// its catch-up lands.
+	s.flushStep2()
+
+	s.mu.Lock()
+
+	s.outstanding = max(s.outstanding-1, 0)
+	s.mode = st.mode
+	s.serverSV = st.serverSV
+
+	// A server that predates lineage says nothing, which is not a
+	// reason to forget what an earlier Synced said.
+	if st.lineage != "" {
+		s.lineage = st.lineage
+	}
+
+	s.mu.Unlock()
 
 	select {
-	case s.synced <- mode:
+	case s.synced <- st:
 	default:
 	}
+}
+
+// abandonedMessage handles a message for a subscription the client
+// has given up: only the end of the handshake it was given up in
+// matters, which is what lets it be unregistered.
+func (s *Subscription) abandonedMessage(msg *collabv1.CollaborateResponse) {
+	s.mu.Lock()
+
+	switch msg.GetPayload().(type) {
+	case *collabv1.CollaborateResponse_Synced:
+		s.outstanding = max(s.outstanding-1, 0)
+	case *collabv1.CollaborateResponse_Close:
+		s.outstanding = 0
+	}
+
+	settled := s.outstanding == 0
+
+	s.mu.Unlock()
+
+	if settled {
+		s.release()
+	}
+}
+
+func (s *Subscription) declaredLineage() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.declared
+}
+
+// step2Flight is a sync step 2 that has gone out, awaiting the step
+// 1 that confirms it.
+type step2Flight struct {
+	// sv is the local state vector the step 2 was computed at, and
+	// hasStructs whether it carried any items. A session that took
+	// it holds everything up to sv.
+	sv         StateVector
+	hasStructs bool
+}
+
+// answerStep1 is the client's half of the handshake: the server's
+// sync step 1 carries its state vector, and the answer is a sync
+// step 2 with everything the local document holds beyond it — edits
+// made offline, or while the subscription was down. It runs on the
+// read loop, before the server's own step 2 has been applied: that
+// adds only items the server has, so the diff is the same either
+// way, and a subscribe given up here leaves the document as it was.
+//
+// A diff is sent when it carries structs, or deletions the session
+// may lack (see unsent). Nothing else is news, however many bytes
+// the delete set takes.
+//
+// A step 1 that follows a step 2 first settles it: taken if the
+// session's state vector now covers what the step 2 carried, dropped
+// if not. While a publish soft-stop is in force the step 2 is held
+// back rather than sent to be refused, and the subscription
+// re-handshakes when the soft-stop clears. A step 2 over
+// MaxSyncStep2Bytes is not sent at all: the subscription is given up
+// with a *ResyncTooLargeError and the local document left as it is.
+func (s *Subscription) answerStep1(serverSV []byte) {
+	// goyjs panics on a state vector it cannot decode, and a Doc
+	// that trapped is dead, so the vector is checked first.
+	sv, err := DecodeStateVector(serverSV)
+	if err != nil {
+		s.abandon(fmt.Errorf(
+			"the server's sync step 1 for %q carried an unreadable state vector: %w",
+			s.docID, err))
+
+		return
+	}
+
+	defer s.flushStep2()
+
+	// Everything here runs on the read loop, as do the events that
+	// change the same state, so the state is read once and written
+	// once: WaitDelivered must not see an in-between.
+	s.mu.Lock()
+	flight := s.inFlight
+	s.mu.Unlock()
+
+	if flight != nil && flight.hasStructs && !sv.Dominates(flight.sv) {
+		s.mu.Lock()
+		s.inFlight = nil
+		s.resyncOwed = false
+		s.dropped = true
+		s.signalDeliveryLocked()
+		s.mu.Unlock()
+
+		return
+	}
+
+	s.docMu.Lock()
+
+	var diff, localSV []byte
+	if s.doc != nil {
+		diff = s.doc.EncodeDiffV1(serverSV)
+		localSV = s.doc.StateVectorV1()
+	}
+
+	s.docMu.Unlock()
+
+	hasStructs, _, parseErr := updateV1DeleteSet(diff)
+
+	s.mu.Lock()
+
+	if flight != nil {
+		// A diff carries the whole delete set, so the session now
+		// holds every deletion the document had when it was sent.
+		s.unsent = nil
+		s.unsentUnknown = false
+	}
+
+	news := !isEmptyUpdateV1(diff) &&
+		(parseErr != nil || hasStructs || s.unsentUnknown || !s.unsent.empty())
+
+	switch {
+	case !news:
+		s.inFlight = nil
+		s.resyncOwed = false
+	case len(diff) > MaxSyncStep2Bytes:
+		// Given up below; the subscription's end is what
+		// WaitDelivered reports.
+	case s.softStopped:
+		s.inFlight = nil
+		s.resyncOwed = true
+	default:
+		// The vector came from goyjs, so it decodes; an empty one
+		// would only weaken the dropped check.
+		local, _ := DecodeStateVector(localSV)
+
+		s.inFlight = &step2Flight{
+			sv:         local,
+			hasStructs: parseErr != nil || hasStructs,
+		}
+		s.resyncOwed = false
+	}
+
+	send := news && !s.softStopped && len(diff) <= MaxSyncStep2Bytes
+
+	s.signalDeliveryLocked()
+	s.mu.Unlock()
+
+	if news && len(diff) > MaxSyncStep2Bytes {
+		s.abandon(&ResyncTooLargeError{
+			Doc:   s.docID,
+			Size:  len(diff),
+			Limit: MaxSyncStep2Bytes,
+		})
+
+		return
+	}
+
+	if !send {
+		return
+	}
+
+	// Sent from the read loop, so it goes out ahead of anything the
+	// caller does once Synced has released the handshake. A failure
+	// is the stream ending, which the read loop reports.
+	_ = s.client.send(s.client.bg, &collabv1.CollaborateRequest{
+		Doc: s.docID,
+		Payload: &collabv1.CollaborateRequest_SyncStep2{
+			SyncStep2: &collabv1.SyncStep2{Diff: diff},
+		},
+	})
+}
+
+// signalDeliveryLocked wakes WaitDelivered. Called with mu held.
+func (s *Subscription) signalDeliveryLocked() {
+	close(s.delivery)
+	s.delivery = make(chan struct{})
+}
+
+// observeEvent follows the publish soft-stop. The service refuses a
+// step 2 during one by sending publish_in_progress, which is the
+// same event that announces the soft-stop, so a publish_in_progress
+// while a step 2 is in flight is taken as its refusal. The window is
+// short: the handshake that sent the step 2 runs again to confirm
+// it. When the soft-stop clears, a subscription owed a resync
+// re-handshakes; if the step 2 had in fact landed, the server's
+// step 1 shows it and there is nothing to send.
+func (s *Subscription) observeEvent(name string) {
+	switch name {
+	case EventPublishInProgress:
+		s.mu.Lock()
+
+		s.softStopped = true
+
+		if s.inFlight != nil {
+			s.inFlight = nil
+			s.resyncOwed = true
+			s.signalDeliveryLocked()
+		}
+
+		s.mu.Unlock()
+	case EventPublishCleared:
+		s.mu.Lock()
+
+		s.softStopped = false
+
+		spawn := s.resyncOwed && !s.rehandshaking
+		if spawn {
+			s.rehandshaking = true
+		}
+
+		s.mu.Unlock()
+
+		if spawn {
+			// Not on the read loop: the handshake waits for a Synced
+			// that only the read loop can deliver.
+			go s.rehandshake()
+		}
+	}
+}
+
+// rehandshake re-runs the handshake on the subscription's own
+// behalf. A refusal ends the subscription and is reported through
+// Err, and a stream that has ended reports itself, so there is
+// nothing to do with the error here.
+func (s *Subscription) rehandshake() {
+	_, _ = s.Resync(s.client.bg)
+
+	s.mu.Lock()
+	s.rehandshaking = false
+	s.mu.Unlock()
+}
+
+// abandon gives up a subscription from the client's side: the server
+// is told to close its half, then the subscription ends with err.
+// The local document is left as it is, and a held server step 2 is
+// never applied to it.
+//
+// The order is what makes subscribing again safe. The Unsubscribe is
+// on the stream before the caller is woken, so a new Subscribe
+// cannot overtake it. And the subscription stays registered, eating
+// whatever the server still sends for it, until the Synced of the
+// handshake it was given up in has arrived; Client.Subscribe waits
+// for that before it claims the document again.
+func (s *Subscription) abandon(err error) {
+	s.mu.Lock()
+
+	if s.abandoned.Load() {
+		s.mu.Unlock()
+
+		return
+	}
+
+	s.abandoned.Store(true)
+
+	s.mu.Unlock()
+
+	s.docMu.Lock()
+	s.heldStep2 = nil
+	s.docMu.Unlock()
+
+	_ = s.client.send(s.client.bg, &collabv1.CollaborateRequest{
+		Doc: s.docID,
+		Payload: &collabv1.CollaborateRequest_Unsubscribe{
+			Unsubscribe: &collabv1.Unsubscribe{},
+		},
+	})
+
+	s.finish(err)
+
+	s.mu.Lock()
+	settled := s.outstanding == 0
+	s.mu.Unlock()
+
+	if settled {
+		s.release()
+	}
+}
+
+// release unregisters the subscription and lets a Subscribe waiting
+// for its document go ahead.
+func (s *Subscription) release() {
+	s.releaseOnce.Do(func() {
+		s.client.drop(s)
+		close(s.released)
+	})
 }
 
 func (s *Subscription) setMode(mode SubscriptionMode) {

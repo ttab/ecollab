@@ -15,19 +15,39 @@ import (
 // scalars. CollabKey is not written — it is the authoring
 // application's to create.
 //
+// The same update writes lineage, a ULID the caller mints for this
+// seed, under LineageKey in a separate root YMap named
+// LineageRootName. The lineage root sits outside rootName, so
+// Materialize never sees it; Lineage reads it back. Every call is a
+// new CRDT lineage whatever lineage it is given — the items carry a
+// fresh client ID — so a lineage must be minted for each seed and
+// never reused for another.
+//
 // The service appends the returned update to a fresh session's
 // stream, so every subsequent subscriber replays the same seed and
 // sees the structure as if the first collaborator had typed it in.
 //
 // BuildSeedUpdate makes no network calls; callers supply the
-// document. A nil doc or an empty rootName is a programmer error.
-func BuildSeedUpdate(doc *newsdoc.Document, rootName string) ([]byte, error) {
+// document. A nil doc, an empty rootName, a rootName equal to
+// LineageRootName or an empty lineage is a programmer error.
+func BuildSeedUpdate(
+	doc *newsdoc.Document, rootName string, lineage string,
+) ([]byte, error) {
 	if doc == nil {
 		return nil, errors.New("nil document")
 	}
 
 	if rootName == "" {
 		return nil, errors.New("empty root name")
+	}
+
+	if rootName == LineageRootName {
+		return nil, fmt.Errorf(
+			"root name %q is reserved for the lineage", rootName)
+	}
+
+	if lineage == "" {
+		return nil, errors.New("empty lineage")
 	}
 
 	yDoc := goyjs.New()
@@ -41,6 +61,11 @@ func BuildSeedUpdate(doc *newsdoc.Document, rootName string) ([]byte, error) {
 		if err := yDoc.MapSet(rootName, k, v); err != nil {
 			return nil, fmt.Errorf("set %s: %w", k, err)
 		}
+	}
+
+	err := yDoc.MapSet(LineageRootName, LineageKey, goyjs.String(lineage))
+	if err != nil {
+		return nil, fmt.Errorf("set lineage: %w", err)
 	}
 
 	return yDoc.EncodeDiffV1(emptySV), nil

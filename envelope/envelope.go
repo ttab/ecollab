@@ -280,6 +280,9 @@ func EncodeClose(doc, reason, message string) ([]byte, error) {
 // discovering by attempting Forward and getting closed on
 // read_only. An empty mode is permitted for legacy reasons but
 // production callers should always populate it.
+//
+// The frame carries the mode and nothing else; EncodeSyncedPayload
+// is the full form, which the service sends.
 func EncodeSynced(doc, mode string) ([]byte, error) {
 	var pl lib0.Encoder
 	pl.WriteVarString(mode)
@@ -287,8 +290,87 @@ func EncodeSynced(doc, mode string) ([]byte, error) {
 	return Encode(Frame{Doc: doc, Type: MessageSynced, Payload: pl.Bytes()})
 }
 
+// SyncedPayload is the decoded inner shape of a MessageSynced frame:
+//
+//	varstring mode          // "read_only" / "read_write"
+//	varstring lineage       // the session's lineage; "" when unknown
+//	varuint   sv_length
+//	bytes     state_vector  // the server's lib0 state vector
+//
+// Lineage and StateVector are what the Collaborate stream carries in
+// its Synced message: the lineage the client persists beside its
+// local document and declares on its next subscribe, and the state
+// vector the server's half of the handshake was computed at. A frame
+// from a server that predates them ends after the mode, and
+// DecodeSyncedPayload leaves both empty; a reader that only wants the
+// mode can keep using DecodeSynced, which stops after the first
+// field and ignores the rest.
+type SyncedPayload struct {
+	Mode        string
+	Lineage     string
+	StateVector []byte
+}
+
+// EncodeSyncedPayload builds a synced frame carrying the mode, the
+// session's lineage and the server's state vector.
+func EncodeSyncedPayload(doc string, p SyncedPayload) ([]byte, error) {
+	var pl lib0.Encoder
+	pl.WriteVarString(p.Mode)
+	pl.WriteVarString(p.Lineage)
+	pl.WriteVarUint(uint64(len(p.StateVector)))
+	pl.WriteBytes(p.StateVector)
+
+	return Encode(Frame{Doc: doc, Type: MessageSynced, Payload: pl.Bytes()})
+}
+
+// DecodeSyncedPayload parses a MessageSynced payload. A payload that
+// ends after the mode — an empty one, or one from EncodeSynced —
+// decodes with an empty lineage and a nil state vector.
+func DecodeSyncedPayload(payload []byte) (SyncedPayload, error) {
+	if len(payload) == 0 {
+		return SyncedPayload{}, nil
+	}
+
+	d := lib0.NewDecoder(payload)
+
+	mode, err := d.ReadVarString()
+	if err != nil {
+		return SyncedPayload{}, fmt.Errorf("synced: read mode: %w", err)
+	}
+
+	p := SyncedPayload{Mode: mode}
+
+	if d.EOF() {
+		return p, nil
+	}
+
+	p.Lineage, err = d.ReadVarString()
+	if err != nil {
+		return SyncedPayload{}, fmt.Errorf("synced: read lineage: %w", err)
+	}
+
+	n, err := d.ReadVarUint()
+	if err != nil {
+		return SyncedPayload{}, fmt.Errorf("synced: read state vector length: %w", err)
+	}
+
+	//nolint:gosec // bounded by the frame length; ReadN re-checks.
+	sv, err := d.ReadN(int(n))
+	if err != nil {
+		return SyncedPayload{}, fmt.Errorf("synced: read state vector: %w", err)
+	}
+
+	if len(sv) > 0 {
+		p.StateVector = sv
+	}
+
+	return p, nil
+}
+
 // DecodeSynced extracts the granted mode from a synced frame.
 // Returns an empty string for legacy frames that lack the payload.
+// Whatever follows the mode is left unread; DecodeSyncedPayload
+// reads the whole frame.
 func DecodeSynced(payload []byte) (string, error) {
 	if len(payload) == 0 {
 		return "", nil
@@ -459,6 +541,14 @@ type SubscribeOptions struct {
 	// don't open. nil means "client did not set this option"
 	// (server default is false).
 	Observer *bool
+
+	// Lineage declares the lineage the client's local document
+	// belongs to: the value the Synced frame reported when the
+	// document was last in sync, persisted beside it. Empty for a
+	// fresh client. The server refuses a lineage that is not the
+	// session's with a Close carrying lineage_mismatch, before it
+	// computes any diff against the Step 1 that follows.
+	Lineage string
 }
 
 // SubscribeOption keys recognised in the on-wire encoding. The
@@ -468,7 +558,14 @@ const (
 	SubscribeOptionAdvertisePresence      = "advertise_presence"
 	SubscribeOptionFreezeOnWorkflowStates = "freeze_on_workflow_states"
 	SubscribeOptionObserver               = "observer"
+	SubscribeOptionLineage                = "lineage"
 )
+
+// MaxLineageLen caps the byte length of a declared lineage. A
+// lineage is a ULID, 26 bytes; the cap leaves room for another
+// identifier shape without letting a hostile client pin a frame's
+// worth of bytes on every pending subscribe.
+const MaxLineageLen = 128
 
 // MaxSubscribeOptionsEntries caps the per-frame option count to
 // guard against pathological clients sending huge option maps. The
@@ -504,6 +601,7 @@ const MaxFreezeWorkflowStateLen = 64
 //   - "advertise_presence":          1 byte (0 or 1)
 //   - "freeze_on_workflow_states":   varuint(N) + N varstring entries
 //   - "observer":                    1 byte (0 or 1)
+//   - "lineage":                     the lineage's bytes, as they are
 //
 // The double length prefix on the value side (outer varbytes plus
 // inner key-specific encoding) is deliberate: it lets future
@@ -538,6 +636,18 @@ func EncodeSubscribeOptions(doc string, opts SubscribeOptions) ([]byte, error) {
 		entries = append(entries, kv{
 			key:   SubscribeOptionObserver,
 			value: []byte{val},
+		})
+	}
+
+	if opts.Lineage != "" {
+		if len(opts.Lineage) > MaxLineageLen {
+			return nil, fmt.Errorf("%w: lineage is %d bytes, max %d",
+				ErrInvalidFrame, len(opts.Lineage), MaxLineageLen)
+		}
+
+		entries = append(entries, kv{
+			key:   SubscribeOptionLineage,
+			value: []byte(opts.Lineage),
 		})
 	}
 
@@ -645,6 +755,14 @@ func DecodeSubscribeOptions(payload []byte) (SubscribeOptions, error) {
 			}
 
 			opts.FreezeOnWorkflowStates = states
+		case SubscribeOptionLineage:
+			if len(valBytes) > MaxLineageLen {
+				return SubscribeOptions{}, fmt.Errorf(
+					"%w: lineage is %d bytes, max %d",
+					ErrInvalidFrame, len(valBytes), MaxLineageLen)
+			}
+
+			opts.Lineage = string(valBytes)
 		default:
 			// Unknown key — skip silently for forward compatibility.
 			// The outer length prefix already advanced the cursor.

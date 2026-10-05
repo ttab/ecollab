@@ -2,10 +2,12 @@ package envelope_test
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/ttab/ecollab/envelope"
+	"github.com/ttab/ecollab/lib0"
 )
 
 // TestRoundTripSyncStep1 covers the most common frame: a client
@@ -466,6 +468,20 @@ func TestRoundTripSubscribeOptions(t *testing.T) {
 				Observer: boolPtr(false),
 			},
 		},
+		{
+			name: "lineage declared",
+			in: envelope.SubscribeOptions{
+				Lineage: "01J9ZK5Y6QFZ3W7X9N1A2B3C4D",
+			},
+		},
+		{
+			name: "lineage with the other options",
+			in: envelope.SubscribeOptions{
+				AdvertisePresence:      boolPtr(true),
+				FreezeOnWorkflowStates: []string{"usable"},
+				Lineage:                "01J9ZK5Y6QFZ3W7X9N1A2B3C4D",
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -532,7 +548,113 @@ func TestRoundTripSubscribeOptions(t *testing.T) {
 						i, got.FreezeOnWorkflowStates[i], want)
 				}
 			}
+
+			if got.Lineage != c.in.Lineage {
+				t.Errorf("Lineage = %q, want %q", got.Lineage, c.in.Lineage)
+			}
 		})
+	}
+}
+
+// TestSubscribeOptionsLineageTooLongRefused: a lineage over
+// MaxLineageLen is refused on both sides, so a hostile client cannot
+// pin a frame's worth of bytes on every pending subscribe.
+func TestSubscribeOptionsLineageTooLongRefused(t *testing.T) {
+	long := strings.Repeat("x", envelope.MaxLineageLen+1)
+
+	_, err := envelope.EncodeSubscribeOptions("doc", envelope.SubscribeOptions{
+		Lineage: long,
+	})
+	if !errors.Is(err, envelope.ErrInvalidFrame) {
+		t.Fatalf("Encode err = %v, want ErrInvalidFrame", err)
+	}
+
+	// Hand-built, since Encode refuses to produce it.
+	var pl lib0.Encoder
+	pl.WriteVarUint(1)
+	pl.WriteVarString(envelope.SubscribeOptionLineage)
+	pl.WriteVarUint(uint64(len(long)))
+	pl.WriteBytes([]byte(long))
+
+	_, err = envelope.DecodeSubscribeOptions(pl.Bytes())
+	if !errors.Is(err, envelope.ErrInvalidFrame) {
+		t.Fatalf("Decode err = %v, want ErrInvalidFrame", err)
+	}
+}
+
+// TestRoundTripSyncedPayload covers the full Synced frame: mode,
+// lineage and the server's state vector, and the two legacy shapes
+// DecodeSyncedPayload has to accept — a mode-only frame from
+// EncodeSynced and an empty payload.
+func TestRoundTripSyncedPayload(t *testing.T) {
+	in := envelope.SyncedPayload{
+		Mode:        "read_write",
+		Lineage:     "01J9ZK5Y6QFZ3W7X9N1A2B3C4D",
+		StateVector: []byte{0x01, 0x05, 0x0a},
+	}
+
+	wire, err := envelope.EncodeSyncedPayload("doc", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame, err := envelope.Decode(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if frame.Type != envelope.MessageSynced {
+		t.Errorf("type = %v, want synced", frame.Type)
+	}
+
+	got, err := envelope.DecodeSyncedPayload(frame.Payload)
+	if err != nil {
+		t.Fatalf("DecodeSyncedPayload: %v", err)
+	}
+
+	if got.Mode != in.Mode || got.Lineage != in.Lineage ||
+		!bytes.Equal(got.StateVector, in.StateVector) {
+		t.Errorf("payload = %+v, want %+v", got, in)
+	}
+
+	// A reader that only wants the mode still gets it.
+	mode, err := envelope.DecodeSynced(frame.Payload)
+	if err != nil {
+		t.Fatalf("DecodeSynced: %v", err)
+	}
+
+	if mode != in.Mode {
+		t.Errorf("DecodeSynced mode = %q, want %q", mode, in.Mode)
+	}
+
+	// A mode-only frame from an older server decodes with the rest
+	// empty.
+	legacy, err := envelope.EncodeSynced("doc", "read_only")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame, err = envelope.Decode(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err = envelope.DecodeSyncedPayload(frame.Payload)
+	if err != nil {
+		t.Fatalf("DecodeSyncedPayload(legacy): %v", err)
+	}
+
+	if got.Mode != "read_only" || got.Lineage != "" || got.StateVector != nil {
+		t.Errorf("legacy payload = %+v, want mode only", got)
+	}
+
+	got, err = envelope.DecodeSyncedPayload(nil)
+	if err != nil {
+		t.Fatalf("DecodeSyncedPayload(empty): %v", err)
+	}
+
+	if got.Mode != "" || got.Lineage != "" || got.StateVector != nil {
+		t.Errorf("empty payload = %+v, want zero", got)
 	}
 }
 

@@ -36,7 +36,7 @@ tree mirrors a `newsdoc.Document`. This package owns that
 correspondence in both directions:
 
 ```go
-update, err := ecollab.BuildSeedUpdate(doc, ecollab.RootName)
+update, err := ecollab.BuildSeedUpdate(doc, ecollab.RootName, lineage)
 // ... apply update, and every update the session produces after it ...
 doc, err := ecollab.Materialize(yDoc, ecollab.RootName)
 ```
@@ -48,7 +48,9 @@ a change to both, and they are round-trip tested together.
 
 The root YMap is named by `RootName` (`"document"`), and
 `CollabKey` (`"_collab"`) names the application-private key the
-translation skips.
+translation skips. The seed also writes a second root, the lineage,
+which is not part of the NewsDoc; see
+["The lineage root"](#the-lineage-root).
 
 ### Yjs structural conventions for NewsDoc
 
@@ -151,6 +153,58 @@ Two consequences worth being explicit about:
   article-editor plugin store in `_collab` during this session" can
   be answered by replaying the archive — though no normal use case
   needs this.
+
+### The lineage root
+
+A seed is a new CRDT lineage. `BuildSeedUpdate` writes into a fresh
+Y.Doc with a client ID of its own, so two seeds built from the same
+NewsDoc carry different item IDs, and an update made against one
+cannot be merged into the other without duplicating the document's
+structure. Nothing in a Yjs update identifies the lineage it belongs
+to, so the lineage is written into the document as content.
+
+`BuildSeedUpdate` takes the lineage, a ULID its caller mints, and
+writes it as a string under `LineageKey` (`"id"`) in a root YMap
+named `LineageRootName` (`"lineage"`). That root sits beside
+`document`, not inside it: `Materialize` walks only the root it is
+given, so the lineage never reaches a NewsDoc, and a test holds it to
+that.
+
+The lineage changes only when the service seeds a fresh session.
+A join replays the session's existing log, and a resume carries the
+previous session's state forward, lineage root included, so neither
+changes it. A client that keeps a document across a disconnect keeps
+its lineage with it, which is what lets the service tell a returning
+client of the same history from one whose history is gone.
+
+**The lineage a client persists and declares comes from the server,
+not from the document.** The service records each session's lineage
+itself, reports it in the `Synced` message that ends every
+subscribe, and checks a client's declared lineage against its own
+record. A client stores that value beside its local copy and
+declares it on its next subscribe. The value in the lineage root is
+document content: any writer to the document can overwrite it with
+an ordinary update, and nothing in the update says it did — a set on
+an existing map key names its neighbour rather than its parent, so
+the write cannot be picked out without the document it applies to.
+A client that took its lineage from the document would declare
+whatever the last writer put there, and every client that did so
+would be refused with `lineage_mismatch` on its next resume.
+
+The root is there for a program holding a Y.Doc and no `Synced`
+message — reading an archived or exported session, say — to learn
+which history the document was seeded as:
+
+```go
+lineage, ok := ecollab.Lineage(yDoc)
+```
+
+```js
+const seededAs = doc.getMap("lineage").get("id")
+```
+
+Treat what it returns as a description, not as an identity to
+declare.
 
 ## Editing what a person is editing
 
@@ -548,6 +602,7 @@ the same vocabulary the live pipeline used:
 | --- | --- |
 | `v1`, `v2` | Yjs document updates. Apply in stream order. |
 | `v1-seed`, `v2-seed` | Yjs updates the emitter called structural seeding rather than authorship. Apply them exactly as `v1` and `v2` — the tag is for attribution, not for filtering. |
+| `v1-resync` | A Yjs v1 update that arrived in a client's sync step 2 while its subscription was opening: edits the client made while it was away. Byte-identical to `v1`, applied and attributed like it. The service stamps it from where the update arrived; a client never claims it. |
 | `aw` | An awareness update. Not document state; never apply it to a Y.Doc. |
 | `evict` | The session ended. A live subscriber sees it as a `Close` with reason `session_terminated`. |
 | `stateless` | A server-issued lifecycle event, `{"event": ..., "data": ...}`. |
@@ -575,7 +630,13 @@ the WebSocket transport. The reason, not the code, is what says what
 to do about it: `no_active_session` means read the repository
 version instead, `session_terminated` means subscribe again for a
 fresh session, `token_expired` means re-authorize, `rate_limited`
-means coalesce rather than reconnect.
+means coalesce rather than reconnect, and `lineage_mismatch` means the
+client's copy belongs to a history the session no longer has — keep
+it, recover what is worth keeping, and subscribe again from empty.
+`lineage_mismatch` is the one reason whose message is structured: it
+is the session's current lineage, bare — or empty when no session was
+open and the subscribe would have seeded a lineage the copy cannot
+belong to.
 
 The constants are untyped, so they compare directly against the
 wire's plain string.
@@ -711,6 +772,14 @@ and decodes every frame type in both directions — sync step 1 and 2,
 updates and seed-tagged updates, awareness, the `Synced` handshake,
 `Close`, stateless events, the server ping, the auth refresh and the
 subscribe options — so the protocol is what round-trips through it.
+
+The offline shape rides in the same frames. The server sends a sync
+step 1 after its step 2, and the client answers it with a step 2 of
+its own, as the stream does. The `Synced` frame's payload is the mode,
+the session's lineage and the server's state vector
+(`SyncedPayload`; `DecodeSynced` still reads the mode alone, and a
+frame from an older server ends after it), and the subscribe-options
+frame carries the lineage a client declares under the `lineage` key.
 
 Server-side clients do not need it: the `Collaborate` bidirectional
 stream carries the same messages as protobuf. The envelope is the

@@ -75,7 +75,7 @@ func TestAgentHoldsItsRangeWhileTheHumansType(t *testing.T) {
 	t.Cleanup(doc.Close)
 
 	// 1. The document, as any transport delivers it: an update.
-	seed, err := ecollab.BuildSeedUpdate(article(), ecollab.RootName)
+	seed, err := ecollab.BuildSeedUpdate(article(), ecollab.RootName, testLineage)
 	if err != nil {
 		t.Fatalf("build the seed update: %v", err)
 	}

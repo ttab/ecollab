@@ -35,6 +35,19 @@ const (
 	EncodingV1Seed Encoding = "v1-seed"
 	EncodingV2Seed Encoding = "v2-seed"
 
+	// EncodingV1Resync is a Yjs v1 update that arrived in a client's
+	// sync step 2 during the handshake that opens a subscription:
+	// what the client had and the session lacked, which is to say
+	// edits made while the client was away. The payload is
+	// byte-identical to EncodingV1 and applies exactly as it does;
+	// the update is persisted, archived and counted as authored by
+	// the subscription that sent it like any other. The tag is the
+	// service's, stamped from where the update arrived rather than
+	// claimed by the client, and it is what lets a reader of the
+	// log tell offline edits from live ones. An update the client
+	// forwards after Synced is plain EncodingV1.
+	EncodingV1Resync Encoding = "v1-resync"
+
 	// EncodingAwareness is a y-protocols/awareness update: who is
 	// present, where their cursor is. It is not document state and
 	// must not be applied to a Y.Doc. The service ships the payload

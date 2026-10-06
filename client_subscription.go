@@ -258,7 +258,9 @@ type Subscription struct {
 //
 // A refusal is an error: a *CloseError carrying the reason when the
 // server closed this document's subscription — CloseReasonReadOnly,
-// CloseReasonNoActiveSession, CloseReasonSubscribeFailed — a
+// CloseReasonNoActiveSession, CloseReasonSessionEnding (an eviction
+// is finishing; subscribe again after a short wait),
+// CloseReasonSubscribeFailed — a
 // *LineageMismatchError when the local document belongs to a history
 // the session no longer has, a *ResyncTooLargeError when its offline
 // edits are too large to send, and the stream's terminal error when

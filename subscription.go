@@ -69,6 +69,19 @@ const (
 	// subscribe opens a new session from the repository version.
 	CloseReasonSessionTerminated = "session_terminated"
 
+	// CloseReasonSessionEnding: an editor asked to subscribe while
+	// the document's session was being evicted — the session has
+	// ended, but the service is still writing its final version and
+	// archive and has not yet released the repository lock, so there
+	// is neither a session to join nor room to open one. Doc-scoped,
+	// and no subscription is opened. The eviction finishes on its
+	// own, so keep the document and its lineage and subscribe again
+	// after a short wait; within the resume bounds the new session
+	// continues the same lineage. A client that reconnects on
+	// hearing session_terminated lands here as a matter of course,
+	// and should back off rather than retry in a tight loop.
+	CloseReasonSessionEnding = "session_ending"
+
 	// CloseReasonLineageMismatch: the client's copy of the document
 	// belongs to a different CRDT lineage than the session — the
 	// lineage it declared on subscribe, or the seed client ID its

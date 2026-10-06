@@ -629,7 +629,9 @@ connection it refuses carries one on the terminal error — in the
 the WebSocket transport. The reason, not the code, is what says what
 to do about it: `no_active_session` means read the repository
 version instead, `session_terminated` means subscribe again for a
-fresh session, `token_expired` means re-authorize, `rate_limited`
+fresh session, `session_ending` means that session's eviction is
+still finishing — keep the document and its lineage and subscribe
+again after a short wait, `token_expired` means re-authorize, `rate_limited`
 means coalesce rather than reconnect, and `lineage_mismatch` means the
 client's copy belongs to a history the session no longer has — keep
 it, recover what is worth keeping, and subscribe again from empty.

@@ -604,7 +604,7 @@ the same vocabulary the live pipeline used:
 | `v1-seed`, `v2-seed` | Yjs updates the emitter called structural seeding rather than authorship. Apply them exactly as `v1` and `v2` — the tag is for attribution, not for filtering. |
 | `v1-resync` | A Yjs v1 update that arrived in a client's sync step 2 while its subscription was opening: edits the client made while it was away. Byte-identical to `v1`, applied and attributed like it. The service stamps it from where the update arrived; a client never claims it. |
 | `aw` | An awareness update. Not document state; never apply it to a Y.Doc. |
-| `evict` | The session ended. A live subscriber sees it as a `Close` with reason `session_terminated`. |
+| `evict` | The session ended. The payload is the JSON `ecollab.SessionTerminated`, and a live subscriber sees it as a `Close` with reason `session_terminated` carrying it as the message; see [Close reasons](#close-reasons). |
 | `stateless` | A server-issued lifecycle event, `{"event": ..., "data": ...}`. |
 | `step2` | The catch-up diff for one subscriber. Addressed to a subscriber rather than to the document, so it is never persisted and never appears in the archive. |
 
@@ -635,10 +635,55 @@ again after a short wait, `token_expired` means re-authorize, `rate_limited`
 means coalesce rather than reconnect, and `lineage_mismatch` means the
 client's copy belongs to a history the session no longer has — keep
 it, recover what is worth keeping, and subscribe again from empty.
-`lineage_mismatch`'s message is structured, in the shape of
-`session_terminated`'s `{reason, version}`: a JSON object,
-`ecollab.LineageMismatch`, holding the session's current `lineage` —
-empty when no session was open and the subscribe would have seeded a
+
+Two of the messages are structured, each a JSON object carrying a
+`reason` and a repository `version`: `session_terminated`'s says how
+the session ended and the state it ended with, and
+`lineage_mismatch`'s says how the client's own lineage ended.
+
+`session_terminated`'s message is `ecollab.SessionTerminated`: the
+`reason` the session ended — `frozen` for a publish, `evicted`, or
+`sketch_promoted` — the repository `version` a freeze published
+(absent for an eviction or a sketch), the `session_id` that ended,
+the `state_vector` the session ended with, the Yjs lib0 state vector,
+and its `delete_set`, a Yjs v1 update with no structs carrying the
+ended state's whole delete set, both base64-encoded:
+
+```json
+{"reason": "frozen", "version": 12, "session_id": "01K6HA2B7C9D3E5F8G0H1J4K6M", "state_vector": "AqTVgcwKOY2Iq7oEAw==", "delete_set": "AAEFAQAC"}
+```
+
+On a freeze `state_vector` is the frozen version's, so it answers
+what a writer most wants to know when a publish takes the document
+from under it: did everything I typed make it in? Compare the local
+document's vector against it. If the session's dominates, everything
+the client made is in the version and there is nothing to keep.
+Otherwise the structs in `Y.encodeStateAsUpdate(doc, state_vector)`
+are exactly the inserts the version lacks, and that update, or the
+whole copy, is what to recover. Its delete set is the copy's whole
+delete set rather than only what the version lacks, so the update is
+never empty: test `Y.decodeUpdate(update).structs.length === 0`, not
+its length, for "nothing missing".
+An absent `state_vector` means the server did not materialise the
+state and the answer is unknown, so treat the copy as possibly
+holding unsaved work. A state vector says nothing about what was
+deleted, so deletions are compared against `delete_set`: a range of
+the copy's own delete set outside it is a deletion the version does
+not hold, and `SessionTerminated.LacksDeletions` makes that
+comparison from the copy's delete set
+(`Y.encodeStateAsUpdate(doc, Y.encodeStateVector(doc))`). Nothing
+missing on both counts means there is nothing to keep. A subscribe
+refused because the document is frozen is closed with
+`subscribe_failed` and the freeze's `SessionTerminated` as its
+message. A subscription the server reaped is closed with
+`session_terminated` and a prose message rather than this object,
+unless the document was frozen under it, when the message is the
+freeze's. `EncodeSessionTerminated` and `DecodeSessionTerminated` are
+the codec, and `ecollab.Terminated` finds a decoded one in a client
+error, on either reason.
+
+`lineage_mismatch`'s message is `ecollab.LineageMismatch`, holding
+the session's current `lineage` — empty when no session was open and the subscribe would have seeded a
 lineage the copy cannot belong to — the `reason` the copy's own
 lineage ended with, and the repository `version` it ended at, so a
 client can tell the person why their offline edits no longer apply and
@@ -840,9 +885,11 @@ Two shapes, and `ecollab.Reason` reads both:
 - `*CloseError` is the server closing **one** subscription, leaving
   the stream and its other documents alone. It is what a refused
   `Subscribe` returns, and what `Subscription.Err` holds after the
-  session was frozen or evicted. A `lineage_mismatch` close arrives
-  as a `*LineageMismatchError`, which carries both lineages and the
-  reason and version, and unwraps to the `*CloseError`.
+  session was frozen or evicted, and `ecollab.Terminated` decodes a
+  `session_terminated` close's message from it. A
+  `lineage_mismatch` close arrives as a `*LineageMismatchError`,
+  which carries both lineages and the reason and version, and
+  unwraps to the `*CloseError`.
 - `*StreamError` is how the stream itself ended: a connection-wide
   refusal is the stream's status rather than a message on it,
   because a Connect stream has one. `Code` is shared between

@@ -22,9 +22,11 @@ type CloseError struct {
 	Reason string
 
 	// Message is the server's detail, where it had one to give. It is
-	// for a log line or a person, never for a branch. The one
-	// structured message is CloseReasonLineageMismatch's, a JSON
-	// LineageMismatch, which LineageMismatchError carries decoded.
+	// for a log line or a person, never for a branch, with two
+	// exceptions that are structured: CloseReasonLineageMismatch's, a
+	// JSON LineageMismatch, which LineageMismatchError carries
+	// decoded, and CloseReasonSessionTerminated's, a JSON
+	// SessionTerminated, which Terminated decodes.
 	Message string
 }
 

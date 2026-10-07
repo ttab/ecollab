@@ -68,8 +68,8 @@ const (
 )
 
 // LineageMismatch is the message of a CloseReasonLineageMismatch
-// close, encoded as JSON. Its shape follows the session_terminated
-// message's {reason, version}.
+// close, encoded as JSON. Its reason and version follow the
+// session_terminated message's, SessionTerminated.
 type LineageMismatch struct {
 	// Lineage is the session's current lineage, or the lineage the
 	// next subscribe would resume. Empty when there was no session

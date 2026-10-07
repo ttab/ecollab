@@ -55,7 +55,11 @@ const (
 
 	// CloseReasonSubscribeFailed: the subscription could not be
 	// opened, for a reason with no vocabulary of its own. The
-	// message carries the detail. Retrying may work.
+	// message carries the detail. Retrying may work. A subscribe
+	// refused because the document is frozen is the one structured
+	// case: its message is the freeze's SessionTerminated, which
+	// Terminated decodes, and retrying will not work until the
+	// document is unfrozen.
 	CloseReasonSubscribeFailed = "subscribe_failed"
 
 	// CloseReasonReadOnly: an update was sent on a read-only
@@ -65,8 +69,14 @@ const (
 
 	// CloseReasonSessionTerminated: the editing session this
 	// subscription belonged to has ended — it was frozen for a
-	// publish, or evicted. The document is not gone; a fresh
-	// subscribe opens a new session from the repository version.
+	// publish, evicted, or the sketch was promoted. The document is
+	// not gone; a fresh subscribe opens a new session from the
+	// repository version. The message is a JSON object,
+	// SessionTerminated, carrying why it ended and the state vector
+	// and delete set it ended with; Terminated decodes it from the
+	// error. A subscription the server reaped is closed with this
+	// reason and a prose message instead, unless the document was
+	// frozen under it.
 	CloseReasonSessionTerminated = "session_terminated"
 
 	// CloseReasonSessionEnding: an editor asked to subscribe while

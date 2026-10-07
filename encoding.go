@@ -57,7 +57,8 @@ const (
 	// EncodingEvict is a server-issued marker saying the session
 	// this entry belongs to has been terminated — the last thing in
 	// the log before the stream is dropped. A live subscriber sees
-	// it as a Close with reason CloseReasonSessionTerminated; a
+	// it as a Close with reason CloseReasonSessionTerminated whose
+	// message is the marker's payload, a JSON SessionTerminated; a
 	// reader of the archive sees where the session ended.
 	EncodingEvict Encoding = "evict"
 

@@ -69,14 +69,17 @@ const (
 
 	// CloseReasonSessionTerminated: the editing session this
 	// subscription belonged to has ended — it was frozen for a
-	// publish, evicted, or the sketch was promoted. The document is
+	// publish, evicted, or the sketch was promoted — or a
+	// service-managed named document was rebuilt into a new
+	// generation, when the client discards its copy. The document is
 	// not gone; a fresh subscribe opens a new session from the
-	// repository version. The message is a JSON object,
-	// SessionTerminated, carrying why it ended and the state vector
-	// and delete set it ended with; Terminated decodes it from the
-	// error. A subscription the server reaped is closed with this
-	// reason and a prose message instead, unless the document was
-	// frozen under it.
+	// repository version, or the new generation of a named
+	// document. The message is a JSON object, SessionTerminated,
+	// carrying why it ended and the state vector and delete set it
+	// ended with; Terminated decodes it from the error. A
+	// subscription the server reaped is closed with this reason and
+	// a prose message instead, unless the document was frozen under
+	// it.
 	CloseReasonSessionTerminated = "session_terminated"
 
 	// CloseReasonSessionEnding: an editor asked to subscribe while

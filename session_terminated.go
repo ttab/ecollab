@@ -7,11 +7,17 @@ import (
 )
 
 // TerminateReason is why a session ended, as a session_terminated
-// close reports it to the subscribers it was closed under.
+// close reports it to the subscribers it was closed under, or, for
+// TerminateReasonRebuilt, why a named document's generation did:
+// that one is not a session ending, and the client must discard its
+// copy rather than keep it.
 //
 // The set may grow: a client must treat a value it does not know as
 // a session that ended for a reason it cannot act on, and subscribe
-// again as for any other.
+// again, except on a service-managed named document, where it
+// discards its copy first as for a rebuild. A client built before a
+// value existed keeps its copy, so a value that asks for the copy to
+// be discarded is safe to send only to clients that know it.
 type TerminateReason string
 
 const (
@@ -33,6 +39,18 @@ const (
 	// repository document, whose sessions begin a lineage of their
 	// own. StateVector, when present, is the promoted sketch's.
 	TerminateReasonSketchPromoted TerminateReason = "sketch_promoted"
+
+	// TerminateReasonRebuilt: a service-managed named document —
+	// today only __presence__ — was rebuilt into a new generation,
+	// materialised afresh from the service's own records under a
+	// fresh client id. The client's copy no longer shares ids with
+	// it: discard the copy rather than merge it, and subscribe
+	// again. The state then arrives on the update stream after
+	// Synced, as a named document's always does. Version is zero,
+	// SessionID empty, as a named document has no session, and
+	// StateVector absent: the ended state of a copy the client
+	// throws away is not worth comparing.
+	TerminateReasonRebuilt TerminateReason = "rebuilt"
 )
 
 // SessionTerminated is the message of a CloseReasonSessionTerminated
@@ -44,18 +62,20 @@ type SessionTerminated struct {
 	Reason TerminateReason `json:"reason"`
 
 	// Version is the repository version a freeze published. Zero
-	// for an eviction or a sketch promotion, and for a freeze the
-	// server has no version for.
+	// for an eviction, a sketch promotion or a rebuild, and for a
+	// freeze the server has no version for.
 	Version int64 `json:"version,omitempty"`
 
 	// SessionID is the session that ended. Empty when the server did
-	// not name it.
+	// not name it, and on a rebuild, as a named document has no
+	// session.
 	SessionID string `json:"session_id,omitempty"`
 
 	// StateVector is the document's Yjs lib0 state vector as the
 	// session ended with it: the frozen version's on a freeze, the
 	// promoted sketch's on a promotion. Absent when the server did
-	// not materialise the state, which a client reads as "unknown".
+	// not materialise the state, which a client reads as "unknown",
+	// and on a rebuild, whose copy the client discards.
 	// Compare the local document's vector against it. The structs in
 	// Y.encodeStateAsUpdate(doc, StateVector) are exactly the inserts
 	// the ended state lacks; its delete set is the local document's

@@ -277,3 +277,22 @@ func endedState(doc *goyjs.Doc) ecollab.SessionTerminated {
 		DeleteSet:   ownDeleteSet(doc),
 	}
 }
+
+// TestSessionTerminatedRebuilt: a rebuild names no version, session or
+// state, so it encodes to the reason alone.
+func TestSessionTerminatedRebuilt(t *testing.T) {
+	in := ecollab.SessionTerminated{Reason: ecollab.TerminateReasonRebuilt}
+
+	msg := ecollab.EncodeSessionTerminated(in)
+
+	if want := `{"reason":"rebuilt"}`; msg != want {
+		t.Errorf("encoded = %s, want %s", msg, want)
+	}
+
+	out, err := ecollab.DecodeSessionTerminated(msg)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	assertSessionTerminated(t, out, in)
+}

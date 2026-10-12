@@ -638,7 +638,8 @@ connection it refuses carries one on the terminal error — in the
 the WebSocket transport. The reason, not the code, is what says what
 to do about it: `no_active_session` means read the repository
 version instead, `session_terminated` means subscribe again for a
-fresh session, `session_ending` means that session's eviction is
+fresh session — throwing the copy away first when its `reason` is
+`rebuilt` — `session_ending` means that session's eviction is
 still finishing — keep the document and its lineage and subscribe
 again after a short wait, `token_expired` means re-authorize, `rate_limited`
 means coalesce rather than reconnect, and `lineage_mismatch` means the
@@ -651,9 +652,9 @@ the session ended and the state it ended with, and
 `lineage_mismatch`'s says how the client's own lineage ended.
 
 `session_terminated`'s message is `ecollab.SessionTerminated`: the
-`reason` the session ended — `frozen` for a publish, `evicted`, or
-`sketch_promoted` — the repository `version` a freeze published
-(absent for an eviction or a sketch), the `session_id` that ended,
+`reason` the session ended — `frozen` for a publish, `evicted`,
+`sketch_promoted`, or `rebuilt` — the repository `version` a freeze
+published (absent otherwise), the `session_id` that ended,
 the `state_vector` the session ended with, the Yjs lib0 state vector,
 and its `delete_set`, a Yjs v1 update with no structs carrying the
 ended state's whole delete set, both base64-encoded:
@@ -689,7 +690,31 @@ message. A subscription the server reaped is closed with
 unless the document was frozen under it, when the message is the
 freeze's. `EncodeSessionTerminated` and `DecodeSessionTerminated` are
 the codec, and `ecollab.Terminated` finds a decoded one in a client
-error, on either reason.
+error, on either close reason.
+
+`rebuilt` is a service-managed named document — today only
+`__presence__` — rebuilt into a new generation: the service
+materialised a fresh document from its own records under a fresh
+client id, and the copy the client holds no longer shares ids with
+it. Discard the copy rather than merge it, and subscribe again; the
+state then arrives on the update stream after `Synced`, as a named
+document's always does, so there is no Step 2 to wait for. The
+message carries no `version`, no `session_id` — a named document has
+no session — and no `state_vector` or `delete_set`, since the ended
+state of a copy the client throws away is not worth comparing:
+
+```json
+{"reason": "rebuilt"}
+```
+
+`rebuilt` is the one reason that is not a session ending, and the
+one where subscribing again with the old copy is wrong: the stale
+copy's entries survive the merge. A client treats a reason it does
+not know as a session that ended and subscribes again, except on a
+service-managed named document, where it discards its copy first as
+for `rebuilt`. A client built before a reason existed keeps its copy,
+so a reason that asks for the copy to be discarded is safe to send
+only to clients that know it.
 
 `lineage_mismatch`'s message is `ecollab.LineageMismatch`, holding
 the session's current `lineage` — empty when no session was open and the subscribe would have seeded a

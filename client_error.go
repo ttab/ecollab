@@ -220,7 +220,8 @@ func (e *StreamError) Unwrap() error {
 //	case ecollab.CloseReasonNoActiveSession:
 //	    // Read the repository version instead.
 //	case ecollab.CloseReasonSessionTerminated:
-//	    // Subscribe again for a fresh session.
+//	    // Subscribe again for a fresh session, discarding the
+//	    // copy first if Terminated says the document was rebuilt.
 //	}
 func Reason(err error) string {
 	var closed *CloseError

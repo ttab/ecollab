@@ -1,6 +1,7 @@
 package ecollab_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/ttab/ecollab"
@@ -107,6 +108,11 @@ func TestBuildSeedUpdateEmptyDoc(t *testing.T) {
 	if got.Type != original.Type {
 		t.Errorf("type = %q, want %q", got.Type, original.Type)
 	}
+
+	txn := doc.NewReadTxn()
+	defer txn.Commit()
+
+	requireEmptyCollab(t, "document", txn, doc.Map(ecollab.RootName))
 }
 
 func TestBuildSeedUpdateNilDocErrors(t *testing.T) {
@@ -345,4 +351,134 @@ func seededDoc(
 	}
 
 	return doc
+}
+
+// requireEmptyCollab fails unless m holds an empty YMap under
+// CollabKey.
+func requireEmptyCollab(t *testing.T, where string, txn *goyjs.ReadTxn, m *goyjs.Map) {
+	t.Helper()
+
+	v, ok := m.Get(txn, ecollab.CollabKey)
+	if !ok {
+		t.Errorf("%s: no %s key", where, ecollab.CollabKey)
+
+		return
+	}
+
+	if v.Kind() != goyjs.KindMap {
+		t.Errorf("%s: %s is %v, want a map", where, ecollab.CollabKey, v.Kind())
+
+		return
+	}
+
+	if n := v.Map().Len(txn); n != 0 {
+		t.Errorf("%s: %s has %d keys, want none", where, ecollab.CollabKey, n)
+	}
+}
+
+// requireBlocksCollab walks a block array and requires an empty
+// CollabKey map on every block, recursing into nested content, meta
+// and links. It returns the number of blocks seen.
+func requireBlocksCollab(t *testing.T, where string, txn *goyjs.ReadTxn, arr *goyjs.Array) int {
+	t.Helper()
+
+	seen := 0
+
+	for i := 0; i < arr.Len(); i++ {
+		v, ok := arr.Get(txn, i)
+		if !ok || v.Kind() != goyjs.KindMap {
+			t.Fatalf("%s[%d]: not a map", where, i)
+		}
+
+		bm := v.Map()
+		path := fmt.Sprintf("%s[%d]", where, i)
+
+		requireEmptyCollab(t, path, txn, bm)
+
+		seen++
+
+		for _, key := range []string{"content", "meta", "links"} {
+			nv, ok := bm.Get(txn, key)
+			if !ok || nv.Kind() != goyjs.KindArray {
+				t.Errorf("%s: no %s array", path, key)
+
+				continue
+			}
+
+			seen += requireBlocksCollab(t, path+"."+key, txn, nv.Array())
+		}
+	}
+
+	return seen
+}
+
+// TestBuildSeedUpdateSeedsEmptyCollab: the seed carries an empty
+// CollabKey map on the document and on every block, nested ones
+// included, and materialising it is unaffected.
+func TestBuildSeedUpdateSeedsEmptyCollab(t *testing.T) {
+	original := &newsdoc.Document{
+		Uuid: "a06f9a4e-1234-4321-aaaa-aaaaaaaaaaaa",
+		Type: "core/article",
+		Content: []*newsdoc.Block{
+			{
+				Id:   "outer",
+				Type: "core/factbox",
+				Content: []*newsdoc.Block{
+					{Id: "inner", Type: "core/text"},
+				},
+			},
+		},
+		Meta: []*newsdoc.Block{
+			{Type: "core/byline", Meta: []*newsdoc.Block{{Type: "core/note"}}},
+		},
+		Links: []*newsdoc.Block{
+			{Type: "core/category", Rel: "subject", Links: []*newsdoc.Block{{Type: "core/x"}}},
+		},
+	}
+
+	update, err := ecollab.BuildSeedUpdate(original, ecollab.RootName, testLineage)
+	if err != nil {
+		t.Fatalf("BuildSeedUpdate: %v", err)
+	}
+
+	doc := goyjs.New()
+	defer doc.Close()
+
+	if err := doc.ApplyUpdateV1(update); err != nil {
+		t.Fatalf("ApplyUpdateV1: %v", err)
+	}
+
+	txn := doc.NewReadTxn()
+
+	root := doc.Map(ecollab.RootName)
+
+	requireEmptyCollab(t, "document", txn, root)
+
+	seen := 0
+
+	for _, key := range []string{"content", "meta", "links"} {
+		v, ok := root.Get(txn, key)
+		if !ok || v.Kind() != goyjs.KindArray {
+			txn.Commit()
+			t.Fatalf("document has no %s array", key)
+		}
+
+		seen += requireBlocksCollab(t, key, txn, v.Array())
+	}
+
+	// Materialize takes its own read transaction on the doc.
+	txn.Commit()
+
+	if seen != 6 {
+		t.Errorf("walked %d blocks, want 6", seen)
+	}
+
+	got, err := ecollab.Materialize(doc, ecollab.RootName)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+
+	if !proto.Equal(original, got) {
+		t.Errorf("round-trip mismatch:\nwant: %+v\ngot:  %+v", original, got)
+	}
 }

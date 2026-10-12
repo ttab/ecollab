@@ -106,8 +106,9 @@ not cost a session its snapshot.
 
 ### The `_collab` key is skipped
 
-Both Document and Block YMaps may carry an additional `_collab` key
-whose value is a YMap. The materialization **skips this key
+Both Document and Block YMaps carry an additional `_collab` key
+whose value is a YMap; `BuildSeedUpdate` writes it empty on the
+document and on every block. The materialization **skips this key
 entirely** — it does not appear in the produced `newsdoc.Document`.
 This is non-negotiable: `_collab` is not part of the NewsDoc schema,
 so leaking it through would cause `Documents.Validate` (and
@@ -138,7 +139,15 @@ archived to S3 with the rest of the session's update log, and is
 visible to all subscribers. When a session evicts (graceful or
 freeze), the next session for the same doc starts from the
 repository's stored NewsDoc, which has no `_collab` content.
-Frontends initialize whatever `_collab` state they need on connect.
+The seed writes `_collab` as an empty YMap on the document and every
+block, so the container always exists and clients never create it;
+they create only their own application key under it. The reason is
+isolation: clients can still race on an individual key such as
+`_collab['se.ecms.article-editor']`, but they no longer race on the
+container, so an application can only conflict with itself instead of
+deleting every other application's state. A lineage seeded before
+this change, or a resumed one that keeps its stored state, may lack
+the key, so `Collab.EnsureField` still creates it when missing.
 
 Two consequences worth being explicit about:
 

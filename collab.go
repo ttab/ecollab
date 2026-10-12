@@ -189,8 +189,11 @@ func (c *Collab) Hydrated(t *goyjs.ReadTxn, appID, field string) bool {
 // held. A program that creates a field another participant is also
 // about to create can therefore destroy that participant's work, and
 // nothing on the wire prevents it. The same hazard applies to each of
-// the three levels: two participants creating CollabKey concurrently
-// lose one application's whole state.
+// the three levels. On a document seeded by BuildSeedUpdate the
+// CollabKey map already exists, so only the application and field
+// levels remain; the CollabKey level of the hazard is left to
+// documents seeded before the seed wrote it, which a resumed lineage
+// keeps as stored.
 //
 // So creating is the exception, and this is the safe order of
 // business:

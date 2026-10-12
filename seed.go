@@ -12,8 +12,13 @@ import (
 // empty Y.Doc with the NewsDoc-shaped tree Materialize reads back:
 // a root YMap named rootName (conventionally RootName), content,
 // meta and links YArrays of block YMaps, and data YMaps of string
-// scalars. CollabKey is not written — it is the authoring
-// application's to create.
+// scalars. Every document map and every block map also carries an
+// empty YMap under CollabKey, so the key always exists and no client
+// has to create it. That is about isolation, not about a single
+// writer: clients still race on their own application's key under
+// CollabKey, but they no longer race on the container, so one
+// application's concurrent create can no longer delete another's
+// whole subtree.
 //
 // The same update writes lineage, a ULID the caller mints for this
 // seed, under LineageKey in a separate root YMap named
@@ -88,6 +93,8 @@ func documentEntries(d *newsdoc.Document) map[string]goyjs.Input {
 		"content":  blockArray(d.Content),
 		"meta":     blockArray(d.Meta),
 		"links":    blockArray(d.Links),
+
+		CollabKey: goyjs.MapValue(nil),
 	}
 
 	return out
@@ -129,6 +136,8 @@ func blockValue(b *newsdoc.Block) goyjs.Input {
 		"content":     blockArray(b.Content),
 		"meta":        blockArray(b.Meta),
 		"links":       blockArray(b.Links),
+
+		CollabKey: goyjs.MapValue(nil),
 	}
 
 	return goyjs.MapValue(entries)

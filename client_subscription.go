@@ -213,9 +213,15 @@ type Subscription struct {
 	// gave no reason, so it is not retried until the next Resync.
 	dropped bool
 
+	// refused is the service's update_refused for work this
+	// subscription sent, for any reason but a publish soft-stop: the
+	// work is not in the session, and nothing sends it again until
+	// the next handshake, which clears it.
+	refused *UpdateRefusedError
+
 	// delivery is closed and replaced whenever inFlight,
-	// resyncOwed or dropped changes, which is what WaitDelivered
-	// waits on.
+	// resyncOwed, dropped or refused changes, which is what
+	// WaitDelivered waits on.
 	delivery chan struct{}
 
 	// outstanding counts the subscribes sent and not yet answered by
@@ -671,16 +677,22 @@ var ErrResyncDropped = errors.New("the session did not take the local changes")
 // or to Close, after resuming waits here first.
 //
 // It returns ErrResyncDropped when the server dropped the step 2
-// without refusing it, the subscription's error when the
-// subscription ends with something still owed, and the context's
-// error when that ends first. Updates made with Update are not
-// tracked here: they are forwarded as they are made.
+// without refusing it, an *UpdateRefusedError when the server
+// refused it, or an update made with Update, for any reason but a
+// soft-stop, the subscription's error when the subscription ends
+// with something still owed, and the context's error when that ends
+// first. Resync sends the work again after either of the first two.
+// Updates made with Update are otherwise not tracked here: they are
+// forwarded as they are made, and one shows up only once the
+// server's refusal of it has arrived. One refused under a soft-stop is owed
+// like a held step 2, and sent with it when the soft-stop clears.
 func (s *Subscription) WaitDelivered(ctx context.Context) error {
 	for {
 		s.mu.Lock()
 
 		var (
 			dropped = s.dropped
+			refused = s.refused
 			owed    = s.inFlight != nil || s.resyncOwed
 			changed = s.delivery
 		)
@@ -688,6 +700,8 @@ func (s *Subscription) WaitDelivered(ctx context.Context) error {
 		s.mu.Unlock()
 
 		switch {
+		case refused != nil:
+			return refused
 		case dropped:
 			return ErrResyncDropped
 		case !owed:
@@ -725,9 +739,11 @@ func (s *Subscription) handshake(
 	s.hsMu.Lock()
 	defer s.hsMu.Unlock()
 
-	// An explicit handshake is a retry of anything dropped.
+	// An explicit handshake is a retry of anything dropped or
+	// refused.
 	s.mu.Lock()
 	s.dropped = false
+	s.refused = nil
 	s.signalDeliveryLocked()
 	s.mu.Unlock()
 
@@ -969,6 +985,10 @@ type step2Flight struct {
 // re-handshakes when the soft-stop clears. A step 2 over
 // MaxSyncStep2Bytes is not sent at all: the subscription is given up
 // with a *ResyncTooLargeError and the local document left as it is.
+// Nor is one sent after the server refused this handshake's step 2
+// for any other reason: the refusal stands until the caller asks
+// again with Resync, rather than the confirming step 1 resending into
+// whatever failed.
 func (s *Subscription) answerStep1(serverSV []byte) {
 	// goyjs panics on a state vector it cannot decode, and a Doc
 	// that trapped is dead, so the vector is checked first.
@@ -1032,6 +1052,9 @@ func (s *Subscription) answerStep1(serverSV []byte) {
 	case len(diff) > MaxSyncStep2Bytes:
 		// Given up below; the subscription's end is what
 		// WaitDelivered reports.
+	case s.refused != nil:
+		// WaitDelivered reports the refusal.
+		s.inFlight = nil
 	case s.softStopped:
 		s.inFlight = nil
 		s.resyncOwed = true
@@ -1047,7 +1070,8 @@ func (s *Subscription) answerStep1(serverSV []byte) {
 		s.resyncOwed = false
 	}
 
-	send := news && !s.softStopped && len(diff) <= MaxSyncStep2Bytes
+	send := news && !s.softStopped && s.refused == nil &&
+		len(diff) <= MaxSyncStep2Bytes
 
 	s.signalDeliveryLocked()
 	s.mu.Unlock()
@@ -1083,16 +1107,26 @@ func (s *Subscription) signalDeliveryLocked() {
 	s.delivery = make(chan struct{})
 }
 
-// observeEvent follows the publish soft-stop. The service refuses a
-// step 2 during one by sending publish_in_progress, which is the
-// same event that announces the soft-stop, so a publish_in_progress
-// while a step 2 is in flight is taken as its refusal. The window is
-// short: the handshake that sent the step 2 runs again to confirm
-// it. When the soft-stop clears, a subscription owed a resync
-// re-handshakes; if the step 2 had in fact landed, the server's
-// step 1 shows it and there is nothing to send.
-func (s *Subscription) observeEvent(name string) {
-	switch name {
+// observeEvent follows the publish soft-stop and the service's
+// refusals of what this subscription sent.
+//
+// A service from before update_refused refuses a step 2 during a
+// soft-stop by sending publish_in_progress, the same event that
+// announces the soft-stop, so a publish_in_progress while a step 2 is
+// in flight is taken as its refusal. The window is short: the
+// handshake that sent the step 2 runs again to confirm it. A newer
+// service also sends update_refused with the publish_in_progress
+// reason, for a step 2 or an update, which marks the work owed even
+// with nothing in flight. When the soft-stop clears, a subscription
+// owed a resync re-handshakes; if the work had in fact landed, the
+// server's step 1 shows it and there is nothing to send.
+//
+// Any other refusal marks the work undelivered and stops there:
+// WaitDelivered reports it, and Resync sends it again. In particular
+// a not_subscribed refusal does not re-handshake, because the Close
+// that ended the subscription may already be on its way.
+func (s *Subscription) observeEvent(ev Event) {
+	switch ev.Name {
 	case EventPublishInProgress:
 		s.mu.Lock()
 
@@ -1105,6 +1139,8 @@ func (s *Subscription) observeEvent(name string) {
 		}
 
 		s.mu.Unlock()
+	case EventUpdateRefused:
+		s.observeRefusal(ev.Data)
 	case EventPublishCleared:
 		s.mu.Lock()
 
@@ -1123,6 +1159,32 @@ func (s *Subscription) observeEvent(name string) {
 			go s.rehandshake()
 		}
 	}
+}
+
+// observeRefusal handles an update_refused. Data that cannot be read
+// is still a refusal, and is taken as the reason a client does not
+// know is: unavailable.
+func (s *Subscription) observeRefusal(data []byte) {
+	reason := UpdateRefusedUnavailable
+
+	if m, err := DecodeUpdateRefused(data); err == nil {
+		reason = m.Reason
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.inFlight = nil
+
+	if reason == UpdateRefusedPublishInProgress {
+		// Owed until the soft-stop clears. The announcement that
+		// comes with the refusal is what marks the soft-stop.
+		s.resyncOwed = true
+	} else {
+		s.refused = &UpdateRefusedError{Doc: s.docID, Reason: reason}
+	}
+
+	s.signalDeliveryLocked()
 }
 
 // rehandshake re-runs the handshake on the subscription's own

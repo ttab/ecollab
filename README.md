@@ -566,6 +566,36 @@ differently is a different document — the round trip through
 under, and going through it is what keeps a writer, a reader and the
 service's inspection on the same root.
 
+### Subscribing to a named document
+
+A named document has no session and no repository version, but its
+`Synced` still names a lineage: the history the client's copy may be
+merged into.
+
+- For `__presence__` it is the document's **generation**. The
+  service rebuilds presence into a new generation under fresh client
+  ids, so a copy of another generation shares nothing with it. Its
+  state arrives on the update stream after `Synced`, and a socket
+  that is up during a rebuild is told with a `session_terminated`
+  close carrying `rebuilt`.
+- For a user-scoped document it is the **stored lineage**, minted
+  when the document is first subscribed and kept beside its state.
+  A user-scoped subscribe is a two-way handshake like a repository
+  document's: the service sends a Step 1 with its own state vector,
+  which the client answers with a Step 2 carrying what it holds that
+  the service lacks, and the catch-up for the client — what changed
+  since the state vector its subscribe carried — arrives as an
+  ordinary update after `Synced`, not as a Step 2 before it.
+
+**A named document is never refused on its declared lineage.** A
+subscribe declaring a lineage other than the current one proceeds:
+the service sends the whole state after a `Synced` naming the current
+lineage, and the client, comparing that with the lineage it holds,
+discards its copy on a difference rather than merging it. A client
+that declares nothing joins and is caught up from its state vector.
+No `lineage_mismatch` close is ever sent for a named document, and a
+user-scoped document never gets `rebuilt`.
+
 ### Allowed Yjs types in named documents
 
 Named documents are *conventionally* restricted to **YMap, YArray,
@@ -629,6 +659,50 @@ the `Synced` message that ends initial state transfer. Believe it:
 an update sent on a `read_only` subscription is refused and closes
 that subscription rather than being ignored.
 
+### Events
+
+A server-issued lifecycle event scoped to one document arrives as an
+`Event` — a `stateless` frame on the WebSocket — with a name and a
+JSON payload. The names are `ecollab.Event*`; a name that is not
+among them is newer than the client and is ignored rather than
+guessed at.
+
+| Event | Means | Data |
+| --- | --- | --- |
+| `publish_in_progress` | A publish has soft-stopped the session: updates are paused until it clears, awareness is not. | `initiated_by`, `expires_at` |
+| `publish_cleared` | The soft-stop is over, because the publish finished or expired. Updates flow again. | `by`, `reason` |
+| `session_reset` | An operator discarded the session's collaborative state; everything the subscription holds locally is gone from the session. | `by`, `reason`, `session_id` |
+| `update_refused` | The service did not forward an update or a sync step 2 the connection sent for the document, so that work is not in the session. | `reason` |
+
+`update_refused` is sent ahead of the `Synced` answering the
+client's next sync check, so a `Synced` still proves that every frame
+before it was taken. Its `reason`, `ecollab.UpdateRefused*`, says
+what to do with the work, which is still in the client's copy:
+
+```json
+{"reason": "unavailable"}
+```
+
+- `unavailable` — the service could not take it: a read it gates
+  updates on, or the append to the session's stream, failed. Keep the
+  work and hand it over again with a fresh handshake.
+- `not_subscribed` — the connection holds no subscription for the
+  document: the update came after the client's own unsubscribe, or
+  after the service ended the subscription and before its `Close`
+  arrived. Keep the work, but do not re-handshake on this alone; the
+  `Close` that follows, or the client's own next subscribe, decides
+  what happens to the document.
+- `publish_in_progress` — refused under a publish soft-stop. It comes
+  *in addition to* the `publish_in_progress` announcement, which keeps
+  its shape, so a client can tell its own refused update from the
+  announcement of a publish. Send the work again after
+  `publish_cleared`.
+
+A reason the client does not know is treated as `unavailable`.
+Read-only, frozen and reaped subscriptions are not answered this
+way: they keep their `Close`. Awareness is never refused with it.
+`DecodeUpdateRefused` reads the payload.
+
 ### Close reasons
 
 A subscription the server closes on its own carries one of
@@ -653,7 +727,8 @@ the session ended and the state it ended with, and
 
 `session_terminated`'s message is `ecollab.SessionTerminated`: the
 `reason` the session ended — `frozen` for a publish, `evicted`,
-`sketch_promoted`, or `rebuilt` — the repository `version` a freeze
+`sketch_promoted`, `sketch_discarded`, `lease_lost`, or `rebuilt` —
+the repository `version` a freeze
 published (absent otherwise), the `session_id` that ended,
 the `state_vector` the session ended with, the Yjs lib0 state vector,
 and its `delete_set`, a Yjs v1 update with no structs carrying the
@@ -691,6 +766,29 @@ unless the document was frozen under it, when the message is the
 freeze's. `EncodeSessionTerminated` and `DecodeSessionTerminated` are
 the codec, and `ecollab.Terminated` finds a decoded one in a client
 error, on either close reason.
+
+`sketch_discarded` is a sketch deleted with `DiscardSketch`: there
+is no document left to subscribe to. The service never materialises
+a sketch it is throwing away, so the message carries no
+`state_vector` or `delete_set`, and the client's copy is the only one
+of whatever it holds:
+
+```json
+{"reason": "sketch_discarded", "session_id": "01K6HA2B7C9D3E5F8G0H1J4K6M"}
+```
+
+`lease_lost` is a session whose repository lease the service lost to
+another holder, which owns the document now. The session's lineage
+has ended and cannot be resumed — no resume state was written — so
+subscribing again begins a new lineage, and the copy is to be
+compared against the repository's current version before any of it
+goes back in, as for a `lineage_mismatch`. The service gave the
+session up without materialising it, so there is no `state_vector`
+or `delete_set`:
+
+```json
+{"reason": "lease_lost", "session_id": "01K6HA2B7C9D3E5F8G0H1J4K6M"}
+```
 
 `rebuilt` is a service-managed named document — today only
 `__presence__` — rebuilt into a new generation: the service
@@ -736,6 +834,7 @@ compare the copy against the version it was last in step with:
 | `promoted` | the sketch became a repository document; `version` is the one the promotion created | can be compared against that version and re-applied to the document |
 | `expired` | nobody came back within the 24 hour resume window; the document itself did not change | can go back in, compared against `version` |
 | `anchor_moved` | the document was written outside collaboration after the eviction, or deleted and recreated | predates the repository's current version; compare before re-applying |
+| `lease_lost` | the service lost the session's repository lease to another holder, which owns the document now | predates whatever that holder wrote; compare against the repository's current version before re-applying |
 | `unknown` | the server has no record of it; also the value for any reason a client does not know | is the client's to judge |
 
 `version` is zero when the lineage knew no repository version, as a
@@ -824,7 +923,7 @@ and the client's usually is in the session — but not always, and
 **`WaitDelivered` is what says so.** It returns nil once nothing is
 owed, waits while a publish soft-stop holds the edits back, and
 returns `ErrResyncDropped` if the server dropped them without a
-refusal. A client that means to discard its persisted copy, or to
+refusal, or an `*UpdateRefusedError` if it refused them. A client that means to discard its persisted copy, or to
 `Close`, after resuming waits on it first; until then, keep the copy.
 
 An answer with nothing the session lacks is not sent. That is not
@@ -840,7 +939,7 @@ value in the document's lineage root; see
 ["The lineage root"](#the-lineage-root) for why. `Resync` declares
 the subscription's current lineage unless told otherwise.
 
-Three things can stop the edits from going through:
+Four things can stop the edits from going through:
 
 - **A publish soft-stop.** The server refuses an update while a
   publish is in progress, the client's Step 2 included. A Step 1 that
@@ -852,7 +951,17 @@ Three things can stop the edits from going through:
   the Step 2 has gone through. The local document is left as it is
   meanwhile. If the refused Step 2 had in fact landed, the
   re-handshake finds nothing to send. A confirmed Step 2 is done
-  with: later publishes do not send it again.
+  with: later publishes do not send it again. A service that sends
+  `update_refused` says so outright, for an update made with `Update`
+  as well as for a Step 2, and an update it refused is owed and sent
+  in the same re-handshake.
+- **An update refusal.** The service could not take the Step 2, or
+  an update, for another reason — it answers `update_refused` with
+  `unavailable` or `not_subscribed`. The client does not send it again
+  on its own: `WaitDelivered` returns an `*UpdateRefusedError`
+  carrying the reason, and a `Resync` sends whatever the session
+  lacks. On `not_subscribed` a `Close` may already be on its way,
+  which is why nothing re-handshakes by itself.
 - **A lineage mismatch.** The session the copy belonged to is gone
   and the document was seeded afresh, so the copy's items cannot be
   merged without duplicating its structure. The server refuses the

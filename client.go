@@ -23,6 +23,17 @@ const (
 	// not. The data carries "initiated_by" and "expires_at".
 	EventPublishInProgress = "publish_in_progress"
 
+	// EventUpdateRefused: the service did not forward an update or a
+	// sync step 2 this connection sent for the document, so the work
+	// is not in the session. The data carries "reason", one of the
+	// UpdateRefused* constants, which DecodeUpdateRefused reads. It
+	// arrives ahead of the Synced answering the client's next sync
+	// check, so a Synced still proves every frame before it. A
+	// refusal under a publish soft-stop comes in addition to the
+	// EventPublishInProgress announcement, which is what tells a
+	// refused update from the announcement of a publish.
+	EventUpdateRefused = "update_refused"
+
 	// EventPublishCleared: the soft-stop is over, either because the
 	// publish finished or because it expired. Updates flow again.
 	// The data carries "by" and "reason".
@@ -611,7 +622,7 @@ func (c *Client) dispatch(msg *collabv1.CollaborateResponse) {
 			Data: p.Event.GetData(),
 		}
 
-		s.observeEvent(ev.Name)
+		s.observeEvent(ev)
 		s.deliverEvent(ev)
 	case *collabv1.CollaborateResponse_Awareness:
 		s.deliverAwareness(p.Awareness.GetUpdate())

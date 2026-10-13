@@ -62,6 +62,14 @@ const (
 	// with; the repository has moved on from it.
 	LineageEndReasonAnchorMoved LineageEndReason = "anchor_moved"
 
+	// LineageEndReasonLeaseLost: the service lost the repository
+	// lease the lineage's session held to another holder, which owns
+	// the document now, so the lineage could not be resumed against
+	// it. Version is the one the copy was last in step with; compare
+	// the copy against the repository's current version before
+	// re-applying any of it.
+	LineageEndReasonLeaseLost LineageEndReason = "lease_lost"
+
 	// LineageEndReasonUnknown: the server has no record of how the
 	// lineage ended, or of the lineage at all.
 	LineageEndReasonUnknown LineageEndReason = "unknown"

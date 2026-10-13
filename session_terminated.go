@@ -40,6 +40,23 @@ const (
 	// own. StateVector, when present, is the promoted sketch's.
 	TerminateReasonSketchPromoted TerminateReason = "sketch_promoted"
 
+	// TerminateReasonSketchDiscarded: the sketch was deleted with
+	// DiscardSketch, and there is no document left to subscribe to.
+	// The service never materialises a sketch it throws away, so
+	// StateVector is absent: whatever the client holds that it did
+	// not save elsewhere is the only copy, and a new sketch is the
+	// only home for it.
+	TerminateReasonSketchDiscarded TerminateReason = "sketch_discarded"
+
+	// TerminateReasonLeaseLost: the service lost the repository lease
+	// the session held to another holder, which owns the document
+	// now. The lineage has ended and cannot be resumed — no resume
+	// state was written, and the next subscribe begins a new one —
+	// so the client's copy is to be compared against the repository
+	// before any of it goes back in. StateVector is absent: the
+	// service gave the session up without materialising it.
+	TerminateReasonLeaseLost TerminateReason = "lease_lost"
+
 	// TerminateReasonRebuilt: a service-managed named document —
 	// today only __presence__ — was rebuilt into a new generation,
 	// materialised afresh from the service's own records under a
@@ -62,8 +79,8 @@ type SessionTerminated struct {
 	Reason TerminateReason `json:"reason"`
 
 	// Version is the repository version a freeze published. Zero
-	// for an eviction, a sketch promotion or a rebuild, and for a
-	// freeze the server has no version for.
+	// for every other reason, and for a freeze the server has no
+	// version for.
 	Version int64 `json:"version,omitempty"`
 
 	// SessionID is the session that ended. Empty when the server did
@@ -75,7 +92,8 @@ type SessionTerminated struct {
 	// session ended with it: the frozen version's on a freeze, the
 	// promoted sketch's on a promotion. Absent when the server did
 	// not materialise the state, which a client reads as "unknown",
-	// and on a rebuild, whose copy the client discards.
+	// as on a sketch discard or a lost lease, and on a rebuild, whose
+	// copy the client discards.
 	// Compare the local document's vector against it. The structs in
 	// Y.encodeStateAsUpdate(doc, StateVector) are exactly the inserts
 	// the ended state lacks; its delete set is the local document's

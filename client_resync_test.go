@@ -47,6 +47,11 @@ type sessionServer struct {
 	refuse bool
 	drop   bool
 
+	// refuseWith answers a step 2 or an update with update_refused
+	// carrying the reason, and with the publish_in_progress
+	// announcement as well for that reason, as the service does.
+	refuseWith ecollab.UpdateRefusedReason
+
 	// open says the server holds a subscription for the document,
 	// so a subscribe is a repeat and gets no step 2.
 	open bool
@@ -91,8 +96,20 @@ func (srv *sessionServer) attach(f *fakeStream) {
 		switch p := req.GetPayload().(type) {
 		case *collabv1.CollaborateRequest_Unsubscribe:
 			srv.open = false
+		case *collabv1.CollaborateRequest_Update:
+			if srv.refuseWith != "" {
+				srv.pushRefusal(f)
+
+				return
+			}
+
+			if err := srv.doc.ApplyUpdateV1(p.Update.GetUpdate()); err != nil {
+				srv.t.Errorf("apply the client's update: %v", err)
+			}
 		case *collabv1.CollaborateRequest_SyncStep2:
 			switch {
+			case srv.refuseWith != "":
+				srv.pushRefusal(f)
 			case srv.refuse:
 				f.push(publishEvent(ecollab.EventPublishInProgress))
 			case srv.drop:
@@ -145,6 +162,28 @@ func (srv *sessionServer) attach(f *fakeStream) {
 				},
 			})
 		}
+	}
+}
+
+// pushRefusal answers a write with update_refused, and for a
+// soft-stop with the announcement too. Called with mu held.
+func (srv *sessionServer) pushRefusal(f *fakeStream) {
+	f.push(refusedEvent(srv.refuseWith))
+
+	if srv.refuseWith == ecollab.UpdateRefusedPublishInProgress {
+		f.push(publishEvent(ecollab.EventPublishInProgress))
+	}
+}
+
+func refusedEvent(reason ecollab.UpdateRefusedReason) *collabv1.CollaborateResponse {
+	return &collabv1.CollaborateResponse{
+		Doc: testDoc,
+		Payload: &collabv1.CollaborateResponse_Event{
+			Event: &collabv1.Event{
+				Name: ecollab.EventUpdateRefused,
+				Data: []byte(`{"reason":"` + string(reason) + `"}`),
+			},
+		},
 	}
 }
 
@@ -779,6 +818,166 @@ func TestClientReportsADroppedStep2(t *testing.T) {
 
 	if got := srv.title(t); got != "Dropped" {
 		t.Errorf("server title = %q, want the edit", got)
+	}
+}
+
+// TestClientReportsARefusedStep2: a step 2 the service refuses as
+// unavailable is reported by WaitDelivered with the reason, the
+// confirming step 1 does not send it again into whatever failed, and
+// a Resync delivers it once the service recovers.
+func TestClientReportsARefusedStep2(t *testing.T) {
+	f := newFakeStream()
+	srv := newSessionServer(t)
+	srv.refuseWith = ecollab.UpdateRefusedUnavailable
+	srv.attach(f)
+
+	c := ecollab.NewClient(t.Context(), f)
+
+	sub, err := c.Subscribe(t.Context(), testDoc,
+		ecollab.WithDoc(srv.offlineCopy(t, "Unavailable")),
+		ecollab.WithLineage(sessionLineage))
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	var refused *ecollab.UpdateRefusedError
+
+	err = sub.WaitDelivered(waitCtx(t))
+	if !errors.As(err, &refused) {
+		t.Fatalf("WaitDelivered = %v, want an *UpdateRefusedError", err)
+	}
+
+	if refused.Reason != ecollab.UpdateRefusedUnavailable || refused.Doc != testDoc {
+		t.Errorf("refusal = %+v, want unavailable for %q", refused, testDoc)
+	}
+
+	if n := len(step2s(f)); n != 1 {
+		t.Errorf("sent %d sync step 2s, want 1 and no resend", n)
+	}
+
+	// The handshake and at most its confirmation, which a refusal
+	// that arrived first makes unnecessary, and nothing on its own.
+	time.Sleep(50 * time.Millisecond)
+
+	if n := len(subscribesSent(f)); n > 2 {
+		t.Errorf("%d subscribes after a refusal, want at most 2", n)
+	}
+
+	srv.set(func(srv *sessionServer) { srv.refuseWith = "" })
+
+	if _, err := sub.Resync(t.Context()); err != nil {
+		t.Fatalf("Resync: %v", err)
+	}
+
+	if err := sub.WaitDelivered(waitCtx(t)); err != nil {
+		t.Errorf("WaitDelivered after the Resync: %v", err)
+	}
+
+	if got := srv.title(t); got != "Unavailable" {
+		t.Errorf("server title = %q, want the edit", got)
+	}
+}
+
+// TestClientNotSubscribedOnlyMarksTheWork: an update refused as
+// not_subscribed is reported undelivered, and the subscription does
+// not re-handshake on it: a Close may already be on its way.
+func TestClientNotSubscribedOnlyMarksTheWork(t *testing.T) {
+	f := newFakeStream()
+	srv := newSessionServer(t)
+	srv.attach(f)
+
+	c := ecollab.NewClient(t.Context(), f)
+
+	sub, err := c.Subscribe(t.Context(), testDoc)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	srv.set(func(srv *sessionServer) {
+		srv.refuseWith = ecollab.UpdateRefusedNotSubscribed
+	})
+
+	before := len(subscribesSent(f))
+
+	err = sub.Update(t.Context(), func(doc *goyjs.Doc) error {
+		return doc.MapSetString(ecollab.RootName, "title", "Orphaned")
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// An update is not tracked until its refusal arrives.
+	var refused *ecollab.UpdateRefusedError
+
+	eventually(t, "the refusal", func() bool {
+		return errors.As(sub.WaitDelivered(waitCtx(t)), &refused)
+	})
+
+	if refused.Reason != ecollab.UpdateRefusedNotSubscribed {
+		t.Fatalf("refusal reason = %q, want not_subscribed", refused.Reason)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	if n := len(subscribesSent(f)); n != before {
+		t.Errorf("%d subscribes after a not_subscribed refusal, want %d",
+			n, before)
+	}
+
+	if n := len(step2s(f)); n != 0 {
+		t.Errorf("sent %d sync step 2s, want none", n)
+	}
+}
+
+// TestClientResendsAnUpdateRefusedDuringSoftStop: an update refused
+// under a soft-stop is owed even though no step 2 was in flight, and
+// the re-handshake when the soft-stop clears delivers it.
+func TestClientResendsAnUpdateRefusedDuringSoftStop(t *testing.T) {
+	f := newFakeStream()
+	srv := newSessionServer(t)
+	srv.attach(f)
+
+	c := ecollab.NewClient(t.Context(), f)
+
+	sub, err := c.Subscribe(t.Context(), testDoc)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	srv.set(func(srv *sessionServer) {
+		srv.refuseWith = ecollab.UpdateRefusedPublishInProgress
+	})
+
+	err = sub.Update(t.Context(), func(doc *goyjs.Doc) error {
+		return doc.MapSetString(ecollab.RootName, "title", "Typed mid-publish")
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// An update is not tracked until its refusal arrives; from then
+	// it is owed.
+	eventually(t, "the update to be owed", func() bool {
+		short, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancel()
+
+		return errors.Is(sub.WaitDelivered(short), context.DeadlineExceeded)
+	})
+
+	srv.set(func(srv *sessionServer) { srv.refuseWith = "" })
+
+	f.push(publishEvent(ecollab.EventPublishCleared))
+
+	if err := sub.WaitDelivered(waitCtx(t)); err != nil {
+		t.Fatalf("WaitDelivered after the soft-stop cleared: %v", err)
+	}
+
+	if got := srv.title(t); got != "Typed mid-publish" {
+		t.Errorf("server title = %q, want the refused edit", got)
+	}
+
+	if n := len(step2s(f)); n != 1 {
+		t.Errorf("sent %d sync step 2s, want 1", n)
 	}
 }
 

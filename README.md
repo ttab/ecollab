@@ -333,6 +333,35 @@ the scope. It means some participant is writing a different structure
 under the same keys, and overwriting it would destroy whatever that
 is.
 
+### Finding and replacing text
+
+A program that edits by content rather than by offset — "replace
+this phrase", "comment on these words" — has to turn the words into
+UTF-16 offsets in the paragraph's delta, and the delta is not the
+text: formatting splits it into runs wherever a mark starts or ends,
+and an inline element such as a link is an embed, one unit wide, with
+its words in its own delta. `FindText` does that search:
+
+```go
+runs := paragraph.Delta()
+
+for _, m := range ecollab.FindText(runs, "dricksvattnet") {
+    // m.Index and m.Length are UTF-16 units in the paragraph.
+}
+```
+
+A match may span runs of different formatting, never an embed: a
+phrase running into a link cannot be formatted or replaced as one
+span of the paragraph, so it is not found. The comparison is exact.
+
+`ReplaceText` turns a match into the delta that replaces it, for
+`Node.ApplyDelta` on the same paragraph. The replacement is written
+with the formatting of the first unit it replaces, explicitly, rather
+than inheriting whatever is in force to its left. Read the runs, find
+and apply in one write scope, so the offsets are true for the
+document they are written to; across a pause, hold a range instead
+(below).
+
 ### Reading where the other participants are
 
 An editor built on `@slate-yjs/core` binds `withCursors` to the

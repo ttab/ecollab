@@ -307,18 +307,21 @@ func decideWhatToAnnotate(
 			// The analysis step. A real agent reasons over the text
 			// here; what it has to come back with is an offset and a
 			// length, and those are in UTF-16 code units because that
-			// is how yjs counts - which is why the offset is
-			// accumulated with UTF16Len rather than with len().
-			offset, found := findRun(paragraph, phrase)
-			if !found {
+			// is how yjs counts. FindText searches the paragraph's
+			// delta rather than its rendering, which carries the
+			// formatting as tags that an offset must not count.
+			found := ecollab.FindText(paragraph.Delta(), phrase)
+			if len(found) == 0 {
 				continue
 			}
+
+			offset := found[0].Index
 
 			// The offset is turned into a range immediately, while the
 			// document it was computed from is still the document.
 			// From here on the agent carries the range and nothing
 			// else.
-			span, err := paragraph.Node().Range(read, offset, goyjs.UTF16Len(phrase))
+			span, err := paragraph.Node().Range(read, offset, found[0].Length)
 			if err != nil {
 				t.Fatalf("hold the run in block %d: %v", i, err)
 			}
@@ -444,32 +447,6 @@ func theColleagueTypes(t *testing.T, doc *goyjs.Doc, block int) {
 	if err != nil {
 		t.Fatalf("type into block %d: %v", block, err)
 	}
-}
-
-// findRun walks the value's delta and returns the UTF-16 offset of the
-// first occurrence of needle. Walking the delta rather than the
-// rendered string is what keeps the offset right: the rendering carries
-// formatting as XML tags, and an offset counted over that would include
-// them.
-func findRun(v goyjs.Value, needle string) (int, bool) {
-	offset := 0
-
-	for _, run := range v.Delta() {
-		if run.Embed != nil {
-			// An embedded node is one unit wide whatever it holds.
-			offset++
-
-			continue
-		}
-
-		if i := strings.Index(run.Text, needle); i >= 0 {
-			return offset + goyjs.UTF16Len(run.Text[:i]), true
-		}
-
-		offset += goyjs.UTF16Len(run.Text)
-	}
-
-	return 0, false
 }
 
 // hydrateAsTheEditorWould stands in for the editing application, which

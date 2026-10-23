@@ -3,6 +3,7 @@ package envelope_test
 import (
 	"bytes"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -482,6 +483,12 @@ func TestRoundTripSubscribeOptions(t *testing.T) {
 				Lineage:                "01J9ZK5Y6QFZ3W7X9N1A2B3C4D",
 			},
 		},
+		{
+			name: "app ids in order",
+			in: envelope.SubscribeOptions{
+				AppIDs: []string{"se.ecms.article-editor", "se.ecms.planning-editor.v2"},
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -551,6 +558,78 @@ func TestRoundTripSubscribeOptions(t *testing.T) {
 
 			if got.Lineage != c.in.Lineage {
 				t.Errorf("Lineage = %q, want %q", got.Lineage, c.in.Lineage)
+			}
+
+			if !slices.Equal(got.AppIDs, c.in.AppIDs) {
+				t.Errorf("AppIDs = %q, want %q", got.AppIDs, c.in.AppIDs)
+			}
+		})
+	}
+}
+
+// TestSubscribeOptionsAppIDsWire pins the app_ids value to the bytes
+// chrome's client writes: the key, then varbytes holding a varuint
+// count and a varstring per id.
+func TestSubscribeOptionsAppIDsWire(t *testing.T) {
+	var pl lib0.Encoder
+
+	pl.WriteVarUint(1)
+	pl.WriteVarString(envelope.SubscribeOptionAppIDs)
+
+	var inner lib0.Encoder
+
+	inner.WriteVarUint(1)
+	inner.WriteVarString("se.x")
+
+	pl.WriteVarUint(uint64(len(inner.Bytes())))
+	pl.WriteBytes(inner.Bytes())
+
+	got, err := envelope.DecodeSubscribeOptions(pl.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(got.AppIDs, []string{"se.x"}) {
+		t.Errorf("AppIDs = %q, want [se.x]", got.AppIDs)
+	}
+}
+
+// TestSubscribeOptionsAppIDsCapped: too many ids, or one too long, is
+// refused on both sides.
+func TestSubscribeOptionsAppIDsCapped(t *testing.T) {
+	tooMany := make([]string, envelope.MaxSubscribeAppIDs+1)
+	for i := range tooMany {
+		tooMany[i] = "se.x"
+	}
+
+	tooLong := []string{strings.Repeat("x", envelope.MaxAppIDLen+1)}
+
+	for name, ids := range map[string][]string{"count": tooMany, "length": tooLong} {
+		t.Run(name, func(t *testing.T) {
+			_, err := envelope.EncodeSubscribeOptions("doc", envelope.SubscribeOptions{AppIDs: ids})
+			if !errors.Is(err, envelope.ErrInvalidFrame) {
+				t.Fatalf("Encode err = %v, want ErrInvalidFrame", err)
+			}
+
+			// Hand-built, since Encode refuses to produce it.
+			var inner lib0.Encoder
+
+			inner.WriteVarUint(uint64(len(ids)))
+
+			for _, id := range ids {
+				inner.WriteVarString(id)
+			}
+
+			var pl lib0.Encoder
+
+			pl.WriteVarUint(1)
+			pl.WriteVarString(envelope.SubscribeOptionAppIDs)
+			pl.WriteVarUint(uint64(len(inner.Bytes())))
+			pl.WriteBytes(inner.Bytes())
+
+			_, err = envelope.DecodeSubscribeOptions(pl.Bytes())
+			if !errors.Is(err, envelope.ErrInvalidFrame) {
+				t.Fatalf("Decode err = %v, want ErrInvalidFrame", err)
 			}
 		})
 	}

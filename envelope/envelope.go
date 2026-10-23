@@ -549,6 +549,12 @@ type SubscribeOptions struct {
 	// session's with a Close carrying lineage_mismatch, before it
 	// computes any diff against the Step 1 that follows.
 	Lineage string
+
+	// AppIDs are the application ids the client stages under, major
+	// included, so the service can warn about a client typing under
+	// an id the mirror registry has superseded. Empty means the
+	// client named none.
+	AppIDs []string
 }
 
 // SubscribeOption keys recognised in the on-wire encoding. The
@@ -559,6 +565,7 @@ const (
 	SubscribeOptionFreezeOnWorkflowStates = "freeze_on_workflow_states"
 	SubscribeOptionObserver               = "observer"
 	SubscribeOptionLineage                = "lineage"
+	SubscribeOptionAppIDs                 = "app_ids"
 )
 
 // MaxLineageLen caps the byte length of a declared lineage. A
@@ -588,6 +595,15 @@ const MaxFreezeOnWorkflowStates = 64
 // per call.
 const MaxFreezeWorkflowStateLen = 64
 
+// MaxSubscribeAppIDs caps the application ids one subscribe names. An
+// editor stages under one, a document with several editors open under
+// a handful; the cap only refuses a client that is not an editor.
+const MaxSubscribeAppIDs = 16
+
+// MaxAppIDLen caps the byte length of one application id. Real ids are
+// reverse-DNS names with a major suffix, well under it.
+const MaxAppIDLen = 128
+
 // EncodeSubscribeOptions builds a subscribe-options frame for doc.
 // Option layout:
 //
@@ -602,6 +618,7 @@ const MaxFreezeWorkflowStateLen = 64
 //   - "freeze_on_workflow_states":   varuint(N) + N varstring entries
 //   - "observer":                    1 byte (0 or 1)
 //   - "lineage":                     the lineage's bytes, as they are
+//   - "app_ids":                     varuint(N) + N varstring entries
 //
 // The double length prefix on the value side (outer varbytes plus
 // inner key-specific encoding) is deliberate: it lets future
@@ -672,6 +689,30 @@ func EncodeSubscribeOptions(doc string, opts SubscribeOptions) ([]byte, error) {
 
 		entries = append(entries, kv{
 			key:   SubscribeOptionFreezeOnWorkflowStates,
+			value: inner.Bytes(),
+		})
+	}
+
+	if len(opts.AppIDs) > 0 {
+		if len(opts.AppIDs) > MaxSubscribeAppIDs {
+			return nil, fmt.Errorf("%w: app_ids count %d exceeds %d",
+				ErrInvalidFrame, len(opts.AppIDs), MaxSubscribeAppIDs)
+		}
+
+		var inner lib0.Encoder
+		inner.WriteVarUint(uint64(len(opts.AppIDs)))
+
+		for i, id := range opts.AppIDs {
+			if len(id) > MaxAppIDLen {
+				return nil, fmt.Errorf("%w: app_ids entry %d is %d bytes, max %d",
+					ErrInvalidFrame, i, len(id), MaxAppIDLen)
+			}
+
+			inner.WriteVarString(id)
+		}
+
+		entries = append(entries, kv{
+			key:   SubscribeOptionAppIDs,
 			value: inner.Bytes(),
 		})
 	}
@@ -763,6 +804,13 @@ func DecodeSubscribeOptions(payload []byte) (SubscribeOptions, error) {
 			}
 
 			opts.Lineage = string(valBytes)
+		case SubscribeOptionAppIDs:
+			ids, err := decodeSubscribeAppIDs(valBytes)
+			if err != nil {
+				return SubscribeOptions{}, err
+			}
+
+			opts.AppIDs = ids
 		default:
 			// Unknown key — skip silently for forward compatibility.
 			// The outer length prefix already advanced the cursor.
@@ -824,4 +872,38 @@ func DecodeStateless(payload []byte) (StatelessPayload, error) {
 	}
 
 	return StatelessPayload{Event: event, Data: d.ReadAll()}, nil
+}
+
+// decodeSubscribeAppIDs decodes the inner varuint(N) + N varstring
+// representation of AppIDs.
+func decodeSubscribeAppIDs(b []byte) ([]string, error) {
+	d := lib0.NewDecoder(b)
+
+	n, err := d.ReadVarUint()
+	if err != nil {
+		return nil, fmt.Errorf("%w: app_ids count: %w", ErrInvalidFrame, err)
+	}
+
+	if n > MaxSubscribeAppIDs {
+		return nil, fmt.Errorf("%w: app_ids count %d exceeds %d",
+			ErrInvalidFrame, n, MaxSubscribeAppIDs)
+	}
+
+	out := make([]string, 0, n)
+
+	for i := uint64(0); i < n; i++ {
+		s, err := d.ReadVarString()
+		if err != nil {
+			return nil, fmt.Errorf("%w: app_ids entry %d: %w", ErrInvalidFrame, i, err)
+		}
+
+		if len(s) > MaxAppIDLen {
+			return nil, fmt.Errorf("%w: app_ids entry %d is %d bytes, max %d",
+				ErrInvalidFrame, i, len(s), MaxAppIDLen)
+		}
+
+		out = append(out, s)
+	}
+
+	return out, nil
 }

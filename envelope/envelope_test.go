@@ -772,3 +772,132 @@ func TestSubscribeOptionsUnknownKeyIgnored(t *testing.T) {
 func boolPtr(b bool) *bool {
 	return &b
 }
+
+func TestRoundTripWatchFrames(t *testing.T) {
+	msg := []byte{0x0a, 0x03, 'a', 'b', 'c', 0x10, 0x01}
+
+	for _, tc := range []struct {
+		name   string
+		encode func([]byte) ([]byte, error)
+		typ    envelope.MessageType
+	}{
+		{"watch", envelope.EncodeWatch, envelope.MessageWatch},
+		{"unwatch", envelope.EncodeUnwatch, envelope.MessageUnwatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wire, err := tc.encode(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			frame, err := envelope.Decode(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if frame.Doc != "" {
+				t.Errorf("doc = %q, want connection-scoped", frame.Doc)
+			}
+
+			if frame.Type != tc.typ {
+				t.Errorf("type = %d, want %d", frame.Type, tc.typ)
+			}
+
+			if !bytes.Equal(frame.Payload, msg) {
+				t.Errorf("payload = %x, want %x", frame.Payload, msg)
+			}
+		})
+	}
+}
+
+func TestWatchFrameNumbersAreStable(t *testing.T) {
+	got := []envelope.MessageType{
+		envelope.MessageWatch, envelope.MessageUnwatch, envelope.MessageLifecycle,
+	}
+
+	if !slices.Equal(got, []envelope.MessageType{10, 11, 12}) {
+		t.Errorf("watch, unwatch, lifecycle = %v, want [10 11 12]", got)
+	}
+
+	if envelope.LifecycleSubtypeEvent != 0 || envelope.LifecycleSubtypeWatching != 1 {
+		t.Errorf("lifecycle subtypes = %d, %d, want 0, 1",
+			envelope.LifecycleSubtypeEvent, envelope.LifecycleSubtypeWatching)
+	}
+}
+
+func TestRoundTripLifecycle(t *testing.T) {
+	msg := []byte{0x0a, 0x24, 0x00, 0xff, 0x80}
+
+	for _, st := range []envelope.LifecycleSubtype{
+		envelope.LifecycleSubtypeEvent, envelope.LifecycleSubtypeWatching,
+	} {
+		wire, err := envelope.EncodeLifecycle(st, msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frame, err := envelope.Decode(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if frame.Doc != "" || frame.Type != envelope.MessageLifecycle {
+			t.Fatalf("frame = %q/%d, want \"\"/%d",
+				frame.Doc, frame.Type, envelope.MessageLifecycle)
+		}
+
+		lp, err := envelope.DecodeLifecycle(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if lp.Subtype != st || !bytes.Equal(lp.Message, msg) {
+			t.Errorf("decoded %d/%x, want %d/%x", lp.Subtype, lp.Message, st, msg)
+		}
+	}
+}
+
+func TestLifecycleWire(t *testing.T) {
+	var pl lib0.Encoder
+
+	pl.WriteVarUint(uint64(envelope.LifecycleSubtypeWatching))
+	pl.WriteBytes([]byte{0x0a, 0x01, 'x'})
+
+	lp, err := envelope.DecodeLifecycle(pl.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if lp.Subtype != envelope.LifecycleSubtypeWatching ||
+		!bytes.Equal(lp.Message, []byte{0x0a, 0x01, 'x'}) {
+		t.Errorf("decoded %d/%x", lp.Subtype, lp.Message)
+	}
+}
+
+func TestLifecycleUnknownSubtypeDecodes(t *testing.T) {
+	wire, err := envelope.EncodeLifecycle(envelope.LifecycleSubtype(7), []byte{1, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame, err := envelope.Decode(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lp, err := envelope.DecodeLifecycle(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if lp.Subtype != 7 || !bytes.Equal(lp.Message, []byte{1, 2}) {
+		t.Errorf("decoded %d/%x", lp.Subtype, lp.Message)
+	}
+}
+
+func TestLifecycleEmptyPayloadRefused(t *testing.T) {
+	_, err := envelope.DecodeLifecycle(nil)
+	if !errors.Is(err, envelope.ErrInvalidFrame) {
+		t.Errorf("err = %v, want ErrInvalidFrame", err)
+	}
+}

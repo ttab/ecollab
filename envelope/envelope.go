@@ -103,6 +103,23 @@ const (
 	// space ends at 8 in the current generation so we own slot 9
 	// onward as collab-specific extensions.
 	MessageSubscribeOptions MessageType = 9
+	// MessageWatch is sent by the client to add documents to the
+	// connection's lifecycle watch set, or to replace the kinds of
+	// ones already in it. The payload is the binary protobuf encoding
+	// of the service's Watch message, opaque to this package. Doc is
+	// "": the watch set belongs to the connection.
+	MessageWatch MessageType = 10
+	// MessageUnwatch is sent by the client to remove documents from
+	// the connection's watch set. The payload is the binary protobuf
+	// encoding of the service's Unwatch message. Doc is "".
+	MessageUnwatch MessageType = 11
+	// MessageLifecycle is sent by the server to a connection that has
+	// watched documents. The payload is a varuint LifecycleSubtype
+	// followed by the binary protobuf encoding of the message it
+	// names; see EncodeLifecycle. Doc is "". A server sends none to a
+	// client that has not watched, so a client that does not know the
+	// frame never sees one.
+	MessageLifecycle MessageType = 12
 )
 
 // SyncType is the first varuint inside a MessageSync payload.
@@ -429,6 +446,71 @@ func DecodeServerPing(payload []byte) (string, error) {
 	}
 
 	return ts, nil
+}
+
+// EncodeWatch builds a watch frame carrying the binary encoding of a
+// Watch message. The frame is connection-scoped, so its doc is "".
+// The message is the payload as it is; a reader takes
+// Frame.Payload.
+func EncodeWatch(watch []byte) ([]byte, error) {
+	return Encode(Frame{Doc: "", Type: MessageWatch, Payload: watch})
+}
+
+// EncodeUnwatch builds an unwatch frame carrying the binary encoding
+// of an Unwatch message. Like the watch frame its doc is "" and its
+// payload is the message as it is.
+func EncodeUnwatch(unwatch []byte) ([]byte, error) {
+	return Encode(Frame{Doc: "", Type: MessageUnwatch, Payload: unwatch})
+}
+
+// LifecycleSubtype is the first varuint inside a MessageLifecycle
+// payload. It names the protobuf message the rest of the payload
+// encodes, since a binary protobuf message does not name itself.
+type LifecycleSubtype uint64
+
+const (
+	// LifecycleSubtypeEvent carries a LifecycleEvent: one event for
+	// one watched document.
+	LifecycleSubtypeEvent LifecycleSubtype = 0
+	// LifecycleSubtypeWatching carries a Watching message, which
+	// closes the initial state of one Watch.
+	LifecycleSubtypeWatching LifecycleSubtype = 1
+)
+
+// LifecyclePayload is the decoded inner shape of a MessageLifecycle
+// frame:
+//
+//	varuint subtype  // see LifecycleSubtype
+//	bytes   message  // binary protobuf, the rest of the frame
+//
+// A subtype this package does not define decodes without error, so a
+// reader can skip a message a newer server sends.
+type LifecyclePayload struct {
+	Subtype LifecycleSubtype
+	Message []byte
+}
+
+// EncodeLifecycle builds a lifecycle frame carrying the binary
+// encoding of the message subtype names. The frame is
+// connection-scoped, so its doc is "".
+func EncodeLifecycle(subtype LifecycleSubtype, message []byte) ([]byte, error) {
+	var pl lib0.Encoder
+	pl.WriteVarUint(uint64(subtype))
+	pl.WriteBytes(message)
+
+	return Encode(Frame{Doc: "", Type: MessageLifecycle, Payload: pl.Bytes()})
+}
+
+// DecodeLifecycle parses a MessageLifecycle payload.
+func DecodeLifecycle(payload []byte) (LifecyclePayload, error) {
+	d := lib0.NewDecoder(payload)
+
+	st, err := d.ReadVarUint()
+	if err != nil {
+		return LifecyclePayload{}, fmt.Errorf("%w: lifecycle subtype: %w", ErrInvalidFrame, err)
+	}
+
+	return LifecyclePayload{Subtype: LifecycleSubtype(st), Message: d.ReadAll()}, nil
 }
 
 // SyncPayload is the decoded inner shape of a MessageSync frame.

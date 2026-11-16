@@ -1102,8 +1102,25 @@ and the layout follows Hocuspocus / y-protocols so an existing
 in-browser Yjs client interoperates unchanged. The package encodes
 and decodes every frame type in both directions — sync step 1 and 2,
 updates and seed-tagged updates, awareness, the `Synced` handshake,
-`Close`, stateless events, the server ping, the auth refresh and the
-subscribe options — so the protocol is what round-trips through it.
+`Close`, stateless events, the server ping, the auth refresh, the
+subscribe options and the lifecycle watch frames — so the protocol is
+what round-trips through it.
+
+Watching documents for session and presence events takes three
+connection-scoped frames, with an empty doc name like the server
+ping:
+
+| Frame | Type | Direction | Payload |
+| --- | --- | --- | --- |
+| `MessageWatch` | 10 | client to server | a `Watch` message |
+| `MessageUnwatch` | 11 | client to server | an `Unwatch` message |
+| `MessageLifecycle` | 12 | server to client | a varuint subtype, then a `LifecycleEvent` (0) or a `Watching` (1) |
+
+Each message is the binary protobuf encoding of the service's own, so
+the WebSocket and the stream share one definition; the envelope
+carries the bytes without reading them (`EncodeWatch`,
+`EncodeUnwatch`, `EncodeLifecycle`, `DecodeLifecycle`). A server sends
+no lifecycle frame to a client that has not watched.
 
 The offline shape rides in the same frames. The server sends a sync
 step 1 after its step 2, and the client answers it with a step 2 of
